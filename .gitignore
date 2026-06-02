@@ -1,7 +1,19 @@
+# Build artifacts
 bin/
-*.log
+*.test
+*.out
+coverage.*
+
+# Local env
 .env
 .env.local
+*.log
+
+# Editor / OS
 .DS_Store
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+*.md
