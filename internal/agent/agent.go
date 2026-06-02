@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
@@ -14,13 +15,14 @@ import (
 )
 
 type Config struct {
-	Version      string
-	PollInterval time.Duration
-	Client       *client.Client
-	Disk         *disk.Manager
-	Lifecycle    *lifecycle.Manager
-	STS          *sts.Rotator
-	Logger       *slog.Logger
+	Version           string
+	PollInterval      time.Duration
+	HeartbeatInterval time.Duration
+	Client            *client.Client
+	Disk              *disk.Manager
+	Lifecycle         *lifecycle.Manager
+	STS               *sts.Rotator
+	Logger            *slog.Logger
 }
 
 type Agent struct {
@@ -32,36 +34,52 @@ func New(cfg Config) *Agent {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 15 * time.Second
 	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = 30 * time.Second
+	}
 	return &Agent{cfg: cfg, started: time.Now()}
 }
+
+const (
+	sseReconnectMin = 1 * time.Second
+	sseReconnectMax = 30 * time.Second
+)
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.cfg.Logger.Info("agent run started",
 		"version", a.cfg.Version,
-		"poll_interval", a.cfg.PollInterval.String(),
+		"heartbeat_interval", a.cfg.HeartbeatInterval.String(),
 	)
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	go a.cfg.STS.Run(ctx, a.cfg.Disk)
+	go a.heartbeatLoop(ctx, cancel)
 
 	if a.cfg.Lifecycle.CurrentState() == lifecycle.StateSynced {
 		a.cfg.Logger.Warn("starting in 'synced' state; waiting for destroy")
 		return a.waitForDestroy(ctx)
 	}
 
-	t := time.NewTicker(a.cfg.PollInterval)
-	defer t.Stop()
-
-	if err := a.tick(ctx); err != nil {
-		a.cfg.Logger.Error("first tick failed", "err", err)
-	}
+	// SSE-reader → канал спеков. Реconnect с exponential backoff + jitter.
+	specs := make(chan *client.AgentSpec, 4)
+	go a.streamLoop(ctx, cancel, specs)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-t.C:
-			if err := a.tick(ctx); err != nil {
-				a.cfg.Logger.Error("tick failed", "err", err)
+		case spec, ok := <-specs:
+			if !ok {
+				return nil
+			}
+			if err := a.handleSpec(ctx, spec); err != nil {
+				if client.IsGone(err) {
+					a.cfg.Logger.Info("backend returned 410 Gone, stopping agent")
+					return nil
+				}
+				a.cfg.Logger.Error("handle spec failed", "err", err)
 				continue
 			}
 			if a.cfg.Lifecycle.CurrentState() == lifecycle.StateSynced {
@@ -77,12 +95,62 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-func (a *Agent) tick(ctx context.Context) error {
-	spec, err := a.cfg.Client.GetSpec(ctx)
-	if err != nil {
-		return fmt.Errorf("fetch spec: %w", err)
+// streamLoop держит SSE-коннект к backend'у с exponential backoff. На 410/401 — отменяет общий ctx.
+func (a *Agent) streamLoop(ctx context.Context, cancel context.CancelFunc, out chan<- *client.AgentSpec) {
+	defer close(out)
+	backoff := sseReconnectMin
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		err := a.cfg.Client.StreamSpec(ctx, out)
+		if ctx.Err() != nil {
+			return
+		}
+		if client.IsGone(err) {
+			a.cfg.Logger.Info("SSE got 410, stopping agent")
+			cancel()
+			return
+		}
+		if err != nil {
+			a.cfg.Logger.Warn("SSE disconnected, reconnecting", "err", err, "backoff", backoff.String())
+		}
+		// jitter ±20% чтобы N агентов не одновременно ломились на reconnect после backend-restart.
+		jitter := time.Duration(rand.Int63n(int64(backoff) / 5))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff + jitter):
+		}
+		backoff *= 2
+		if backoff > sseReconnectMax {
+			backoff = sseReconnectMax
+		}
 	}
+}
 
+// heartbeatLoop пингует backend независимо от reconcile. На 410 — cancel'ит общий context.
+func (a *Agent) heartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
+	t := time.NewTicker(a.cfg.HeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := a.cfg.Client.Heartbeat(ctx); err != nil {
+				if client.IsGone(err) {
+					a.cfg.Logger.Info("heartbeat got 410, stopping agent")
+					cancel()
+					return
+				}
+				a.cfg.Logger.Warn("heartbeat failed", "err", err)
+			}
+		}
+	}
+}
+
+func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	observedLifecycle := lifecycle.StateAlive
 	var disksObserved []client.AgentDiskObserved
 

@@ -58,17 +58,22 @@ func main() {
 	executor := system.NewExecutor(logger)
 	systemd := system.NewSystemd(executor, logger)
 	diskMgr := disk.NewManager(systemd, executor, logger)
+	if cfg.DiskDriver == config.DiskDriverDirect {
+		diskMgr.SetDirectMode(true)
+		logger.Info("disk driver: direct (rclone --daemon, без systemd)")
+	}
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
-	stsRotator := sts.NewRotator(httpClient, executor, logger, 12*time.Hour)
+	stsRotator := sts.NewRotator(httpClient, executor, logger, cfg.StsRotateInterval)
 
 	a := agent.New(agent.Config{
-		Version:      version,
-		PollInterval: 15 * time.Second,
-		Client:       httpClient,
-		Disk:         diskMgr,
-		Lifecycle:    lifecycleMgr,
-		STS:          stsRotator,
-		Logger:       logger,
+		Version:           version,
+		PollInterval:      15 * time.Second,
+		HeartbeatInterval: cfg.HeartbeatInterval,
+		Client:            httpClient,
+		Disk:              diskMgr,
+		Lifecycle:         lifecycleMgr,
+		STS:               stsRotator,
+		Logger:            logger,
 	})
 
 	if err := a.Run(ctx); err != nil && ctx.Err() == nil {
