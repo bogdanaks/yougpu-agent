@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// Executor runs external commands. Mockable for tests.
 type Executor interface {
 	Run(ctx context.Context, timeout time.Duration, name string, args ...string) (stdout string, err error)
 }

@@ -9,10 +9,9 @@ import (
 
 const (
 	defaultSystemctlTimeout = 60 * time.Second
-	stopTimeout             = 30 * time.Minute // rclone flush can take a while
+	stopTimeout             = 30 * time.Minute
 )
 
-// Systemd wraps `systemctl` calls. Mockable interface for tests.
 type Systemd interface {
 	DaemonReload(ctx context.Context) error
 	Enable(ctx context.Context, unit string) error
@@ -63,15 +62,15 @@ func (s *Systemctl) Restart(ctx context.Context, unit string) error {
 	return err
 }
 
+// IsActive treats a non-active exit code as `false` rather than an error — `systemctl is-active`
+// exits non-zero whenever the unit is not active, even for normal states like "inactive".
 func (s *Systemctl) IsActive(ctx context.Context, unit string) (bool, error) {
 	out, err := s.exec.Run(ctx, defaultSystemctlTimeout, "systemctl", "is-active", unit)
-	// `systemctl is-active` exits non-zero when not active. That's expected, not an agent error.
 	state := strings.TrimSpace(out)
 	if state == "active" {
 		return true, nil
 	}
 	if err != nil && state != "" {
-		// Non-active states ("inactive", "failed", "unknown") → just not active.
 		return false, nil
 	}
 	return false, err

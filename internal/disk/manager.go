@@ -1,5 +1,3 @@
-// Package disk управляет rclone-mount'ами: генерит systemd unit per drive,
-// маунтит/анмаунтит через systemctl, перечисляет существующие unit'ы для reconcile.
 package disk
 
 import (
@@ -21,11 +19,12 @@ import (
 )
 
 const (
-	unitDir         = "/etc/systemd/system"
-	unitPrefix      = "yougpu-storage-"
-	defaultQuotaGB  = 5
-	minQuotaGB      = 2
-	reservedFreeGB  = 15
+	unitDir        = "/etc/systemd/system"
+	unitPrefix     = "storage-mount-"
+	rcloneRemote   = "remote"
+	defaultQuotaGB = 5
+	minQuotaGB     = 2
+	reservedFreeGB = 15
 )
 
 //go:embed unit.tmpl
@@ -35,18 +34,18 @@ var unitTemplate = template.Must(template.New("unit").Parse(unitTmpl))
 
 type unitParams struct {
 	DriveID   string
+	Remote    string
 	Bucket    string
 	S3Path    string
 	MountPath string
 	QuotaGB   int
 }
 
-// Manager owns the mount lifecycle for storage drives.
 type Manager struct {
 	systemd  system.Systemd
 	exec     system.Executor
 	log      *slog.Logger
-	unitsDir string // overridable for tests
+	unitsDir string
 }
 
 func NewManager(systemd system.Systemd, exec system.Executor, log *slog.Logger) *Manager {
@@ -58,7 +57,6 @@ func NewManager(systemd system.Systemd, exec system.Executor, log *slog.Logger) 
 	}
 }
 
-// UnitsDir is exposed for tests that want to point at a tmpdir.
 func (m *Manager) SetUnitsDir(dir string) { m.unitsDir = dir }
 
 func (m *Manager) Mount(ctx context.Context, spec client.AgentDiskSpec) error {
@@ -72,6 +70,7 @@ func (m *Manager) Mount(ctx context.Context, spec client.AgentDiskSpec) error {
 	quota := m.perDriveQuotaGB(ctx)
 	params := unitParams{
 		DriveID:   spec.ID,
+		Remote:    rcloneRemote,
 		Bucket:    spec.Bucket,
 		S3Path:    spec.S3Path,
 		MountPath: spec.MountPath,
@@ -99,7 +98,6 @@ func (m *Manager) Mount(ctx context.Context, spec client.AgentDiskSpec) error {
 		return fmt.Errorf("start %s: %w", unitName, err)
 	}
 
-	// rclone --notify makes systemd block until mount is ready; double-check anyway.
 	time.Sleep(1 * time.Second)
 	active, err := m.systemd.IsActive(ctx, unitName)
 	if err != nil {
@@ -125,7 +123,7 @@ func (m *Manager) Unmount(ctx context.Context, driveID string) error {
 		}
 	}
 	if err := m.systemd.Disable(ctx, unitName); err != nil {
-		m.log.Debug("systemctl disable returned error (likely already disabled)", "unit", unitName, "err", err)
+		m.log.Debug("systemctl disable returned error", "unit", unitName, "err", err)
 	}
 
 	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
@@ -138,7 +136,6 @@ func (m *Manager) Unmount(ctx context.Context, driveID string) error {
 	return nil
 }
 
-// ListUnits walks /etc/systemd/system and returns drive_ids for which a unit file exists.
 func (m *Manager) ListUnits() ([]string, error) {
 	entries, err := os.ReadDir(m.unitsDir)
 	if err != nil {
@@ -161,13 +158,12 @@ func (m *Manager) ListUnits() ([]string, error) {
 	return ids, nil
 }
 
-// IsActive reports whether the unit for driveID is currently active.
 func (m *Manager) IsActive(ctx context.Context, driveID string) (bool, error) {
 	return m.systemd.IsActive(ctx, unitNameFor(driveID))
 }
 
-// RestartAll graceful-restarts all yougpu-storage-* units, one at a time, waiting for each
-// to come back before touching the next. Used by sts.Rotator after refreshing credentials.
+// RestartAll restarts all storage-mount units one at a time, waiting for each to come
+// back active before touching the next. Called after credentials rotation.
 func (m *Manager) RestartAll(ctx context.Context) error {
 	ids, err := m.ListUnits()
 	if err != nil {
@@ -178,7 +174,6 @@ func (m *Manager) RestartAll(ctx context.Context) error {
 		if err := m.systemd.Restart(ctx, unit); err != nil {
 			return fmt.Errorf("restart %s: %w", unit, err)
 		}
-		// Give rclone a beat to remount before stopping the next one.
 		time.Sleep(2 * time.Second)
 		active, err := m.systemd.IsActive(ctx, unit)
 		if err != nil || !active {
@@ -192,15 +187,13 @@ func unitNameFor(driveID string) string { return unitPrefix + driveID + ".servic
 
 var dfFreeGB = regexp.MustCompile(`(\d+)G`)
 
-// perDriveQuotaGB matches the bash heuristic from the legacy getRcloneBlock: split
-// (free - 15GB) across all mounted drives, floor at 2GB. On failure → defaultQuotaGB.
+// perDriveQuotaGB splits (free - reserved) across all mounted drives, floored at minQuotaGB.
 func (m *Manager) perDriveQuotaGB(ctx context.Context) int {
 	out, err := m.exec.Run(ctx, 5*time.Second, "df", "-BG", "/")
 	if err != nil {
 		m.log.Warn("df failed, using default quota", "err", err)
 		return defaultQuotaGB
 	}
-	// Parse line 2 column 4 ("...  10G ...")
 	lines := strings.Split(out, "\n")
 	if len(lines) < 2 {
 		return defaultQuotaGB
@@ -222,8 +215,6 @@ func (m *Manager) perDriveQuotaGB(ctx context.Context) int {
 		total = minQuotaGB
 	}
 
-	// Count current units to compute per-drive share. Add 1 for the one being mounted now
-	// if it's not yet present (avoid divide-by-zero, slight over-allocation is fine).
 	ids, _ := m.ListUnits()
 	count := len(ids)
 	if count < 1 {

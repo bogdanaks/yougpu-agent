@@ -1,6 +1,3 @@
-// Package sts периодически рефрешит S3 credentials у backend'а (12h-сессии MinIO STS)
-// и переписывает rclone.conf. После переписывания зовёт restartAll, чтобы все mount'ы
-// подхватили новые ключи без потери данных.
 package sts
 
 import (
@@ -18,10 +15,9 @@ import (
 const (
 	defaultRcloneConfigPath = "/root/.config/rclone/rclone.conf"
 	configFileMode          = 0o600
-	rcloneRemote            = "yougpu-r2"
+	rcloneRemote            = "remote"
 )
 
-// Restarter — то, что Rotator зовёт после обновления creds: рестарт всех rclone-mount'ов.
 type Restarter interface {
 	RestartAll(ctx context.Context) error
 }
@@ -46,8 +42,6 @@ func NewRotator(c *client.Client, exec system.Executor, log *slog.Logger, interv
 
 func (r *Rotator) SetConfigPath(p string) { r.configPath = p }
 
-// RotateOnce выполняет один цикл ротации. Используется при старте (initial creds) и
-// при ошибке Auth от S3 (caller сам решит когда дёрнуть).
 func (r *Rotator) RotateOnce(ctx context.Context, restarter Restarter) error {
 	creds, err := r.client.RotateStorageKeys(ctx)
 	if err != nil {
@@ -64,12 +58,11 @@ func (r *Rotator) RotateOnce(ctx context.Context, restarter Restarter) error {
 	return nil
 }
 
-// Run запускает периодическую ротацию. Блокируется до отмены ctx.
-// Первый цикл выполняется немедленно (initial creds), дальше — по тикеру.
+// Run blocks until ctx is cancelled. First rotation runs immediately (initial creds),
+// subsequent ones on a ticker.
 func (r *Rotator) Run(ctx context.Context, restarter Restarter) {
 	if err := r.RotateOnce(ctx, nil); err != nil {
-		// At boot there are usually no mounts yet — restarter==nil to avoid no-op churn.
-		r.log.Error("initial sts rotation failed", "err", err)
+		r.log.Error("initial rotation failed", "err", err)
 	}
 
 	t := time.NewTicker(r.interval)
@@ -81,9 +74,9 @@ func (r *Rotator) Run(ctx context.Context, restarter Restarter) {
 			return
 		case <-t.C:
 			if err := r.RotateOnce(ctx, restarter); err != nil {
-				r.log.Error("sts rotation failed", "err", err)
+				r.log.Error("rotation failed", "err", err)
 			} else {
-				r.log.Info("sts credentials rotated")
+				r.log.Info("credentials rotated")
 			}
 		}
 	}

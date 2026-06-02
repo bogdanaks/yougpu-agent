@@ -14,17 +14,20 @@ type Config struct {
 }
 
 const (
-	defaultTokenFile = "/var/lib/yougpu/provisioning_token"
-	defaultStateDir  = "/var/lib/yougpu"
+	envBackendURL    = "AGENT_BACKEND_URL"
+	envTokenFile     = "AGENT_TOKEN_FILE"
+	envStateDir      = "AGENT_STATE_DIR"
+	defaultTokenFile = "/var/lib/agent/token"
+	defaultStateDir  = "/var/lib/agent"
 )
 
 func Load() (*Config, error) {
-	backendURL := strings.TrimRight(os.Getenv("YOUGPU_BACKEND_URL"), "/")
+	backendURL := strings.TrimRight(os.Getenv(envBackendURL), "/")
 	if backendURL == "" {
-		return nil, errors.New("YOUGPU_BACKEND_URL is required")
+		return nil, fmt.Errorf("%s is required", envBackendURL)
 	}
 
-	tokenFile := os.Getenv("YOUGPU_TOKEN_FILE")
+	tokenFile := os.Getenv(envTokenFile)
 	if tokenFile == "" {
 		tokenFile = defaultTokenFile
 	}
@@ -33,7 +36,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("read token from %s: %w", tokenFile, err)
 	}
 
-	stateDir := os.Getenv("YOUGPU_STATE_DIR")
+	stateDir := os.Getenv(envStateDir)
 	if stateDir == "" {
 		stateDir = defaultStateDir
 	}

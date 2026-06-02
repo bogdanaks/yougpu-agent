@@ -75,15 +75,12 @@ func (f *fakeSystemd) Poweroff(context.Context) error { f.record("poweroff"); re
 type fakeExec struct{}
 
 func (fakeExec) Run(context.Context, time.Duration, string, ...string) (string, error) {
-	// Pretend df reports 100G free → quota math: (100-15)/1 = 85.
 	return "Filesystem     1G-blocks  Used Available Use% Mounted on\n/dev/sda1            100G   10G       100G   10% /\n", nil
 }
 
 func newTestManager(t *testing.T) (*Manager, *fakeSystemd, string) {
 	t.Helper()
 	tmp := t.TempDir()
-	mountsTmp := t.TempDir()
-	_ = mountsTmp
 	sd := newFakeSystemd()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := NewManager(sd, fakeExec{}, log)
@@ -96,7 +93,7 @@ func TestMountWritesUnitAndStarts(t *testing.T) {
 	spec := client.AgentDiskSpec{
 		ID:           "abc",
 		DesiredState: client.DesiredMounted,
-		Bucket:       "yougpu-r2",
+		Bucket:       "test-bucket",
 		S3Path:       "u/abc/",
 		MountPath:    filepath.Join(t.TempDir(), "mount"),
 	}
@@ -105,19 +102,20 @@ func TestMountWritesUnitAndStarts(t *testing.T) {
 		t.Fatalf("mount: %v", err)
 	}
 
-	unitPath := filepath.Join(tmp, "yougpu-storage-abc.service")
+	unitName := "storage-mount-abc.service"
+	unitPath := filepath.Join(tmp, unitName)
 	body, err := os.ReadFile(unitPath)
 	if err != nil {
 		t.Fatalf("read unit: %v", err)
 	}
-	if !bytes.Contains(body, []byte("yougpu-r2:yougpu-r2/u/abc/")) {
+	if !bytes.Contains(body, []byte("remote:test-bucket/u/abc/")) {
 		t.Errorf("unit missing rclone path:\n%s", body)
 	}
 	if !bytes.Contains(body, []byte(spec.MountPath)) {
 		t.Errorf("unit missing mount path:\n%s", body)
 	}
 
-	want := []string{"daemon-reload", "enable:yougpu-storage-abc.service", "start:yougpu-storage-abc.service"}
+	want := []string{"daemon-reload", "enable:" + unitName, "start:" + unitName}
 	for _, c := range want {
 		found := false
 		for _, got := range sd.calls {
@@ -134,7 +132,7 @@ func TestMountWritesUnitAndStarts(t *testing.T) {
 
 func TestUnmountRemovesUnit(t *testing.T) {
 	m, sd, tmp := newTestManager(t)
-	unitName := "yougpu-storage-xyz.service"
+	unitName := "storage-mount-xyz.service"
 	if err := os.WriteFile(filepath.Join(tmp, unitName), []byte("placeholder"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -156,10 +154,10 @@ func TestUnmountRemovesUnit(t *testing.T) {
 func TestListUnits(t *testing.T) {
 	m, _, tmp := newTestManager(t)
 	files := []string{
-		"yougpu-storage-a.service",
-		"yougpu-storage-bbb.service",
+		"storage-mount-a.service",
+		"storage-mount-bbb.service",
 		"unrelated.service",
-		"yougpu-storage-x.timer",
+		"storage-mount-x.timer",
 	}
 	for _, f := range files {
 		if err := os.WriteFile(filepath.Join(tmp, f), []byte(""), 0o644); err != nil {

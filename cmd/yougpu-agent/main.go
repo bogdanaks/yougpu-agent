@@ -35,7 +35,7 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	logger.Info("starting yougpu-agent", "version", version)
+	logger.Info("agent starting", "version", version)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -76,5 +76,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("yougpu-agent stopped")
+	logger.Info("agent stopped")
 }

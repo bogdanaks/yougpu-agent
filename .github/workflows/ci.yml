@@ -19,6 +19,6 @@ jobs:
       - run: make build-linux
       - uses: actions/upload-artifact@v4
         with:
-          name: yougpu-agent-linux-amd64
+          name: agent-linux-amd64
           path: bin/yougpu-agent-linux-amd64
           if-no-files-found: error

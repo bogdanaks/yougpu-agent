@@ -12,9 +12,9 @@ func TestReconcile(t *testing.T) {
 		return client.AgentDiskSpec{
 			ID:           id,
 			DesiredState: desired,
-			Bucket:       "yougpu-r2",
+			Bucket:       "test-bucket",
 			S3Path:       "u/" + id + "/",
-			MountPath:    "/workspace/storage/" + id,
+			MountPath:    "/mnt/" + id,
 		}
 	}
 
@@ -22,7 +22,7 @@ func TestReconcile(t *testing.T) {
 		name     string
 		spec     *client.AgentSpec
 		observed ObservedState
-		want     []string // canonical "kind:id" strings
+		want     []string
 	}{
 		{
 			name:     "nil spec → no actions",
@@ -75,8 +75,8 @@ func TestReconcile(t *testing.T) {
 		{
 			name: "mix: one new, one stable, one orphan",
 			spec: &client.AgentSpec{Disks: []client.AgentDiskSpec{
-				mk("a", "mounted"), // already mounted
-				mk("b", "mounted"), // new, must mount
+				mk("a", "mounted"),
+				mk("b", "mounted"),
 			}},
 			observed: ObservedState{
 				MountedDiskIDs: map[string]bool{"a": true, "orphan": true},
@@ -85,7 +85,7 @@ func TestReconcile(t *testing.T) {
 			want: []string{"mount:b", "unmount_orphan:orphan"},
 		},
 		{
-			name: "unit exists but not active, desired=mounted → MountDisk (restart)",
+			name: "unit exists but not active, desired=mounted → MountDisk",
 			spec: &client.AgentSpec{Disks: []client.AgentDiskSpec{mk("a", "mounted")}},
 			observed: ObservedState{
 				MountedDiskIDs: map[string]bool{},

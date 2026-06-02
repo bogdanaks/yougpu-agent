@@ -1,12 +1,12 @@
 [Unit]
-Description=YouGPU Rclone S3 Mount ({{.DriveID}})
+Description=S3 Storage Mount ({{.DriveID}})
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
 TimeoutStopSec=1800
-ExecStart=/usr/bin/rclone mount yougpu-r2:{{.Bucket}}/{{.S3Path}} {{.MountPath}} \
+ExecStart=/usr/bin/rclone mount {{.Remote}}:{{.Bucket}}/{{.S3Path}} {{.MountPath}} \
   --config /root/.config/rclone/rclone.conf \
   --vfs-cache-mode full \
   --vfs-cache-max-size {{.QuotaGB}}G \

@@ -1,16 +1,9 @@
-// Package reconcile вычисляет список Action'ов, необходимых чтобы привести наблюдаемое
-// состояние VM к желаемому, описанному в AgentSpec. Чистая функция без I/O — всё
-// тестируется в reconcile_test.go без mocks systemd/exec.
 package reconcile
 
 import "github.com/bogdanaks/yougpu-agent/internal/client"
 
-// Reconcile сравнивает spec и observed, возвращает план действий.
-//
-// Семантика lifecycle: если backend выставил deletion_requested_at, mount/unmount-действия
-// НЕ генерируются — на этом этапе агент готовится к sync'у, новые маунты бессмысленны
-// (всё равно через минуту будем стопать). Этот фильтр обеспечивается caller'ом (agent.Run),
-// который не зовёт Reconcile когда lifecycle ≠ alive.
+// Reconcile returns the list of actions needed to bring observed state into spec.
+// Pure function: no I/O, fully unit-testable.
 func Reconcile(spec *client.AgentSpec, observed ObservedState) []Action {
 	if spec == nil {
 		return nil
@@ -34,7 +27,6 @@ func Reconcile(spec *client.AgentSpec, observed ObservedState) []Action {
 		}
 	}
 
-	// Orphan unit cleanup: unit'ы для дисков, исчезнувших из spec (detached в БД).
 	for id := range observed.UnitDiskIDs {
 		if !specIDs[id] {
 			actions = append(actions, UnmountOrphan{ID: id})

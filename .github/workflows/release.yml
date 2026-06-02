@@ -9,7 +9,6 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     permissions:
-      # Required by softprops/action-gh-release to create/update the release.
       contents: write
     steps:
       - uses: actions/checkout@v4
@@ -25,16 +24,11 @@ jobs:
       - name: Build linux/amd64
         run: |
           VERSION="${{ steps.ver.outputs.version }}" make build-linux
-          # Backend's cloud-init expects the exact filename "yougpu-agent-linux-amd64"
-          # at <releaseDownloadURL>/<tag>/yougpu-agent-linux-amd64.
-          mv bin/yougpu-agent-linux-amd64 bin/yougpu-agent-linux-amd64
           sha256sum bin/yougpu-agent-linux-amd64 > bin/yougpu-agent-linux-amd64.sha256
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Tag is the immutable URL piece; filename must match the constant in
-          # cloud-init.generator.ts (otherwise existing VMs can't curl their agent).
           files: |
             bin/yougpu-agent-linux-amd64
             bin/yougpu-agent-linux-amd64.sha256

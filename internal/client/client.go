@@ -15,12 +15,9 @@ import (
 const (
 	tokenHeader      = "x-provisioning-token"
 	defaultTimeout   = 30 * time.Second
-	maxResponseBytes = 1 << 20 // 1 MiB — spec is tiny; protects against runaway responses
+	maxResponseBytes = 1 << 20
 )
 
-// Client wraps HTTP calls to the backend's /instances/:id/agent/* endpoints.
-// BaseURL must already include the per-instance prefix, e.g.
-//   https://api.yougpu.ru/instances/<uuid>/agent
 type Client struct {
 	baseURL string
 	token   string
@@ -112,9 +109,6 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	if out == nil {
 		return nil
 	}
-	// Backend wraps successful payloads in {status,code,data,meta?} via TransformInterceptor.
-	// For /spec — out is AgentSpec, but envelope's `data` field carries it. Decode the envelope
-	// generically and re-decode `data` into the typed out param.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
@@ -124,11 +118,9 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		Data   json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		// Some endpoints (or unwrapped errors) might not match envelope — fall back to direct decode.
 		return json.Unmarshal(raw, out)
 	}
 	if len(env.Data) == 0 {
-		// Endpoint isn't enveloped — decode the whole body as the target type.
 		return json.Unmarshal(raw, out)
 	}
 	return json.Unmarshal(env.Data, out)
