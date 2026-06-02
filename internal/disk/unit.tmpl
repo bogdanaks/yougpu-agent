@@ -1,0 +1,25 @@
+[Unit]
+Description=YouGPU Rclone S3 Mount ({{.DriveID}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+TimeoutStopSec=1800
+ExecStart=/usr/bin/rclone mount yougpu-r2:{{.Bucket}}/{{.S3Path}} {{.MountPath}} \
+  --config /root/.config/rclone/rclone.conf \
+  --vfs-cache-mode full \
+  --vfs-cache-max-size {{.QuotaGB}}G \
+  --vfs-cache-max-age 24h \
+  --dir-cache-time 1m \
+  --vfs-read-chunk-size 32M \
+  --vfs-read-chunk-size-limit 2G \
+  --allow-other \
+  --daemon-timeout=10m
+ExecStop=/bin/fusermount -uz {{.MountPath}}
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=YouGPU Declarative Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/yougpu-agent.env
+ExecStart=/usr/local/bin/yougpu-agent
+Restart=always
+RestartSec=30
+# Tame restart loops: if 5 starts within 5 min, systemd holds off (paged by backend watchdog).
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target
