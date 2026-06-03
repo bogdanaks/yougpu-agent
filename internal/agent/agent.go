@@ -18,16 +18,19 @@ type Config struct {
 	Version           string
 	PollInterval      time.Duration
 	HeartbeatInterval time.Duration
+	ReconcileInterval time.Duration
 	Client            *client.Client
 	Disk              *disk.Manager
 	Lifecycle         *lifecycle.Manager
-	STS               *sts.Rotator
+	Creds             *sts.Provider
 	Logger            *slog.Logger
 }
 
 type Agent struct {
-	cfg     Config
-	started time.Time
+	cfg         Config
+	started     time.Time
+	knownDiskID map[string]bool
+	lastSpec    *client.AgentSpec
 }
 
 func New(cfg Config) *Agent {
@@ -37,7 +40,14 @@ func New(cfg Config) *Agent {
 	if cfg.HeartbeatInterval == 0 {
 		cfg.HeartbeatInterval = 30 * time.Second
 	}
-	return &Agent{cfg: cfg, started: time.Now()}
+	if cfg.ReconcileInterval == 0 {
+		cfg.ReconcileInterval = 60 * time.Second
+	}
+	return &Agent{
+		cfg:         cfg,
+		started:     time.Now(),
+		knownDiskID: map[string]bool{},
+	}
 }
 
 const (
@@ -49,12 +59,17 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.cfg.Logger.Info("agent run started",
 		"version", a.cfg.Version,
 		"heartbeat_interval", a.cfg.HeartbeatInterval.String(),
+		"reconcile_interval", a.cfg.ReconcileInterval.String(),
 	)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go a.cfg.STS.Run(ctx, a.cfg.Disk)
+	if err := a.cfg.Creds.EnsureFresh(ctx); err != nil {
+		a.cfg.Logger.Error("initial credentials fetch failed", "err", err)
+	}
+
+	go a.cfg.Creds.Run(ctx)
 	go a.heartbeatLoop(ctx, cancel)
 
 	if a.cfg.Lifecycle.CurrentState() == lifecycle.StateSynced {
@@ -62,9 +77,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		return a.waitForDestroy(ctx)
 	}
 
-	// SSE-reader → канал спеков. Реconnect с exponential backoff + jitter.
 	specs := make(chan *client.AgentSpec, 4)
 	go a.streamLoop(ctx, cancel, specs)
+
+	reconcileTicker := time.NewTicker(a.cfg.ReconcileInterval)
+	defer reconcileTicker.Stop()
 
 	for {
 		select {
@@ -74,6 +91,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+			a.lastSpec = spec
 			if err := a.handleSpec(ctx, spec); err != nil {
 				if client.IsGone(err) {
 					a.cfg.Logger.Info("backend returned 410 Gone, stopping agent")
@@ -91,11 +109,22 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 				return nil
 			}
+		case <-reconcileTicker.C:
+			if a.lastSpec == nil {
+				continue
+			}
+			a.cfg.Logger.Debug("periodic reconcile tick")
+			if err := a.handleSpec(ctx, a.lastSpec); err != nil {
+				if client.IsGone(err) {
+					a.cfg.Logger.Info("backend returned 410 Gone during reconcile, stopping agent")
+					return nil
+				}
+				a.cfg.Logger.Warn("periodic reconcile failed", "err", err)
+			}
 		}
 	}
 }
 
-// streamLoop держит SSE-коннект к backend'у с exponential backoff. На 410/401 — отменяет общий ctx.
 func (a *Agent) streamLoop(ctx context.Context, cancel context.CancelFunc, out chan<- *client.AgentSpec) {
 	defer close(out)
 	backoff := sseReconnectMin
@@ -115,7 +144,6 @@ func (a *Agent) streamLoop(ctx context.Context, cancel context.CancelFunc, out c
 		if err != nil {
 			a.cfg.Logger.Warn("SSE disconnected, reconnecting", "err", err, "backoff", backoff.String())
 		}
-		// jitter ±20% чтобы N агентов не одновременно ломились на reconnect после backend-restart.
 		jitter := time.Duration(rand.Int63n(int64(backoff) / 5))
 		select {
 		case <-ctx.Done():
@@ -129,7 +157,6 @@ func (a *Agent) streamLoop(ctx context.Context, cancel context.CancelFunc, out c
 	}
 }
 
-// heartbeatLoop пингует backend независимо от reconcile. На 410 — cancel'ит общий context.
 func (a *Agent) heartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 	t := time.NewTicker(a.cfg.HeartbeatInterval)
 	defer t.Stop()
@@ -162,6 +189,7 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		observedLifecycle = state
 	} else {
 		_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
+		a.refreshCredsIfDiskSetChanged(ctx, spec)
 		disksObserved = a.reconcileDisks(ctx, spec)
 	}
 
@@ -178,11 +206,39 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	return nil
 }
 
+func (a *Agent) refreshCredsIfDiskSetChanged(ctx context.Context, spec *client.AgentSpec) {
+	specIDs := make(map[string]bool, len(spec.Disks))
+	hasNew := false
+	for _, d := range spec.Disks {
+		specIDs[d.ID] = true
+		if !a.knownDiskID[d.ID] {
+			hasNew = true
+		}
+	}
+	a.knownDiskID = specIDs
+	if !hasNew {
+		return
+	}
+	a.cfg.Logger.Info("disk set changed, refreshing credentials to update scope")
+	if err := a.cfg.Creds.ForceRefresh(ctx); err != nil {
+		a.cfg.Logger.Error("force refresh on disk-set change failed", "err", err)
+	}
+}
+
 func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []client.AgentDiskObserved {
 	observed := a.observeDisks(ctx)
 	actions := reconcile.Reconcile(spec, observed)
 
+	if len(actions) == 0 {
+		a.cfg.Logger.Debug("reconcile no-op",
+			"generation", spec.Generation,
+			"disks_in_spec", len(spec.Disks),
+			"mounted", len(observed.MountedDiskIDs),
+		)
+	}
+
 	errs := map[string]string{}
+	mountErrored := false
 	for _, action := range actions {
 		switch v := action.(type) {
 		case reconcile.MountDisk:
@@ -190,6 +246,7 @@ func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []cl
 			if err := a.cfg.Disk.Mount(ctx, v.Spec); err != nil {
 				a.cfg.Logger.Error("mount failed", "id", v.Spec.ID, "err", err)
 				errs[v.Spec.ID] = truncate(err.Error(), 1024)
+				mountErrored = true
 			}
 		case reconcile.UnmountDisk:
 			a.cfg.Logger.Info("unmounting disk", "id", v.ID)
@@ -201,6 +258,26 @@ func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []cl
 			a.cfg.Logger.Info("unmounting orphan unit", "id", v.ID)
 			if err := a.cfg.Disk.Unmount(ctx, v.ID); err != nil {
 				a.cfg.Logger.Error("orphan unmount failed", "id", v.ID, "err", err)
+			}
+		}
+	}
+
+	if mountErrored {
+		a.cfg.Logger.Warn("mount error detected, forcing credentials refresh and retrying once")
+		if err := a.cfg.Creds.ForceRefresh(ctx); err != nil {
+			a.cfg.Logger.Error("force refresh after mount error failed", "err", err)
+		} else {
+			retryActions := reconcile.Reconcile(spec, a.observeDisks(ctx))
+			for _, action := range retryActions {
+				if v, ok := action.(reconcile.MountDisk); ok {
+					a.cfg.Logger.Info("retrying mount after creds refresh", "id", v.Spec.ID)
+					if err := a.cfg.Disk.Mount(ctx, v.Spec); err != nil {
+						a.cfg.Logger.Error("retry mount failed", "id", v.Spec.ID, "err", err)
+						errs[v.Spec.ID] = truncate(err.Error(), 1024)
+					} else {
+						delete(errs, v.Spec.ID)
+					}
+				}
 			}
 		}
 	}
@@ -245,7 +322,6 @@ func (a *Agent) observeDisks(ctx context.Context) reconcile.ObservedState {
 	return reconcile.ObservedState{MountedDiskIDs: mounted, UnitDiskIDs: unit}
 }
 
-// waitForDestroy keeps reporting "synced" until the process is killed externally.
 func (a *Agent) waitForDestroy(ctx context.Context) error {
 	t := time.NewTicker(a.cfg.PollInterval)
 	defer t.Stop()

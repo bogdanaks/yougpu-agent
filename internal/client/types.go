@@ -1,5 +1,7 @@
 package client
 
+import "time"
+
 type AgentSpec struct {
 	Generation int64           `json:"generation"`
 	Lifecycle  SpecLifecycle   `json:"lifecycle"`
@@ -55,11 +57,13 @@ const (
 	LifecycleDestroyingSelf = "destroying_self"
 )
 
-type RotateStorageKeysResponse struct {
-	Endpoint     string `json:"endpoint"`
-	AccessKey    string `json:"accessKey"`
-	SecretKey    string `json:"secretKey"`
-	SessionToken string `json:"sessionToken"`
+type StorageCredentials struct {
+	Endpoint     string    `json:"endpoint"`
+	AccessKey    string    `json:"accessKey"`
+	SecretKey    string    `json:"secretKey"`
+	SessionToken string    `json:"sessionToken"`
+	ExpiresAt    time.Time `json:"expiresAt"`
+	CredentialID string    `json:"credentialId"`
 }
 
 type ProvisioningStatusRequest struct {

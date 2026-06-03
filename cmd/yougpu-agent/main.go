@@ -43,6 +43,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: parseLogLevel(cfg.LogLevel),
+	}))
+	slog.SetDefault(logger)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -58,21 +63,23 @@ func main() {
 	executor := system.NewExecutor(logger)
 	systemd := system.NewSystemd(executor, logger)
 	diskMgr := disk.NewManager(systemd, executor, logger)
+	diskMgr.SetRcPortBase(cfg.RcloneRcPortBase)
 	if cfg.DiskDriver == config.DiskDriverDirect {
 		diskMgr.SetDirectMode(true)
 		logger.Info("disk driver: direct (rclone --daemon, без systemd)")
 	}
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
-	stsRotator := sts.NewRotator(httpClient, executor, logger, cfg.StsRotateInterval)
+	credsProvider := sts.NewProvider(httpClient, diskMgr, logger, cfg.CredsRefreshThreshold, cfg.CredsPeriodicInterval)
 
 	a := agent.New(agent.Config{
 		Version:           version,
 		PollInterval:      15 * time.Second,
 		HeartbeatInterval: cfg.HeartbeatInterval,
+		ReconcileInterval: cfg.ReconcileInterval,
 		Client:            httpClient,
 		Disk:              diskMgr,
 		Lifecycle:         lifecycleMgr,
-		STS:               stsRotator,
+		Creds:             credsProvider,
 		Logger:            logger,
 	})
 
@@ -82,4 +89,17 @@ func main() {
 	}
 
 	logger.Info("agent stopped")
+}
+
+func parseLogLevel(s string) slog.Level {
+	switch s {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }

@@ -110,6 +110,12 @@ func (c *Client) PostStatus(ctx context.Context, status *AgentStatus) error {
 	if err := c.do(ctx, http.MethodPost, "/status", status, nil); err != nil {
 		return fmt.Errorf("post status: %w", err)
 	}
+	c.log.Debug("status reported",
+		"generation", status.ObservedGeneration,
+		"lifecycle", status.Lifecycle.ObservedState,
+		"disks", len(status.Disks),
+		"uptime_sec", status.UptimeSec,
+	)
 	return nil
 }
 
@@ -119,6 +125,7 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	if err := c.do(ctx, http.MethodPut, "/heartbeat", nil, nil); err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
 	}
+	c.log.Debug("heartbeat sent")
 	return nil
 }
 
@@ -131,13 +138,19 @@ func IsGone(err error) bool {
 	return false
 }
 
-func (c *Client) RotateStorageKeys(ctx context.Context) (*RotateStorageKeysResponse, error) {
-	var resp RotateStorageKeysResponse
-	if err := c.do(ctx, http.MethodPost, "/rotate-storage-keys", nil, &resp); err != nil {
-		return nil, fmt.Errorf("rotate storage keys: %w", err)
+func (c *Client) GetStorageCredentials(ctx context.Context) (*StorageCredentials, error) {
+	var resp StorageCredentials
+	if err := c.do(ctx, http.MethodPost, "/storage/credentials", nil, &resp); err != nil {
+		return nil, fmt.Errorf("get storage credentials: %w", err)
 	}
 	if resp.AccessKey == "" {
-		return nil, errors.New("rotate storage keys: empty access key in response")
+		return nil, errors.New("get storage credentials: empty access key in response")
+	}
+	if resp.ExpiresAt.IsZero() {
+		return nil, errors.New("get storage credentials: missing expiresAt in response")
+	}
+	if resp.CredentialID == "" {
+		resp.CredentialID = resp.AccessKey
 	}
 	return &resp, nil
 }

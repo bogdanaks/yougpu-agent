@@ -15,7 +15,10 @@ ExecStart=/usr/bin/rclone mount {{.Remote}}:{{.Bucket}}/{{.S3Path}} {{.MountPath
   --vfs-read-chunk-size 32M \
   --vfs-read-chunk-size-limit 2G \
   --allow-other \
-  --daemon-timeout=10m
+  --daemon-timeout=10m \
+  --rc \
+  --rc-addr 127.0.0.1:{{.RcPort}} \
+  --rc-no-auth
 ExecStop=/bin/fusermount -uz {{.MountPath}}
 Restart=on-failure
 RestartSec=10

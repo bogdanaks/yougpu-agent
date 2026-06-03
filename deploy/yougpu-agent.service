@@ -2,6 +2,8 @@
 Description=Agent
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -9,8 +11,6 @@ EnvironmentFile=/etc/yougpu-agent.env
 ExecStart=/usr/local/bin/yougpu-agent
 Restart=always
 RestartSec=30
-StartLimitBurst=5
-StartLimitIntervalSec=300
 
 [Install]
 WantedBy=multi-user.target
