@@ -59,6 +59,7 @@ type AgentStatus struct {
 	Disks        []AgentDiskObserved     `json:"disks,omitempty"`
 	Container    *AgentContainerObserved `json:"container,omitempty"`
 	Firewall     *AgentFirewallObserved  `json:"firewall,omitempty"`
+	Setup        *AgentSetupObserved     `json:"setup,omitempty"`
 	AgentVersion string                  `json:"agent_version,omitempty"`
 	UptimeSec    int64                   `json:"uptime_sec,omitempty"`
 }
@@ -86,6 +87,14 @@ type AgentFirewallObserved struct {
 	LastError     *string `json:"last_error"`
 }
 
+type AgentSetupObserved struct {
+	ObservedState string  `json:"observed_state"`
+	Progress      *int    `json:"progress,omitempty"`
+	Detail        *string `json:"detail,omitempty"`
+	LastError     *string `json:"last_error,omitempty"`
+	LastLog       *string `json:"last_log,omitempty"`
+}
+
 const (
 	ObservedMounted   = "mounted"
 	ObservedUnmounted = "unmounted"
@@ -99,6 +108,13 @@ const (
 
 	FirewallApplied = "applied"
 	FirewallError   = "error"
+
+	SetupInstallingBase    = "installing_base"
+	SetupInstallingDocker  = "installing_docker"
+	SetupConfiguringGPU    = "configuring_gpu"
+	SetupInstallingStorage = "installing_storage"
+	SetupReady             = "ready"
+	SetupError             = "error"
 
 	LifecycleAlive          = "alive"
 	LifecycleSyncing        = "syncing"

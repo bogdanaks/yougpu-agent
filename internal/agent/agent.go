@@ -10,25 +10,62 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
-	"github.com/bogdanaks/yougpu-agent/internal/container"
-	"github.com/bogdanaks/yougpu-agent/internal/disk"
-	"github.com/bogdanaks/yougpu-agent/internal/firewall"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/reconcile"
-	"github.com/bogdanaks/yougpu-agent/internal/sts"
 )
+
+type AgentClient interface {
+	PostStatus(ctx context.Context, status *client.AgentStatus) error
+	StreamSpec(ctx context.Context, out chan<- *client.AgentSpec) error
+	Heartbeat(ctx context.Context) error
+}
+
+type DiskManager interface {
+	Mount(ctx context.Context, spec client.AgentDiskSpec) error
+	Unmount(ctx context.Context, id string) error
+	ListUnits() ([]string, error)
+	IsActive(ctx context.Context, id string) (bool, error)
+}
+
+type ContainerReconciler interface {
+	Reconcile(ctx context.Context, spec *client.AgentContainerSpec) client.AgentContainerObserved
+	SetReporter(func(context.Context, client.AgentContainerObserved))
+}
+
+type FirewallReconciler interface {
+	Reconcile(ctx context.Context, spec *client.AgentFirewallSpec) client.AgentFirewallObserved
+}
+
+type HostSetup interface {
+	Reconcile(ctx context.Context) client.AgentSetupObserved
+	SetReporter(func(context.Context, client.AgentSetupObserved))
+}
+
+type LifecycleManager interface {
+	CurrentState() string
+	SetState(state string) error
+	HandleTermination(ctx context.Context, disker lifecycle.Disker) (string, error)
+	Poweroff(ctx context.Context) error
+}
+
+type CredsProvider interface {
+	EnsureFresh(ctx context.Context) error
+	ForceRefresh(ctx context.Context) error
+	Run(ctx context.Context)
+}
 
 type Config struct {
 	Version           string
 	PollInterval      time.Duration
 	HeartbeatInterval time.Duration
 	ReconcileInterval time.Duration
-	Client            *client.Client
-	Disk              *disk.Manager
-	Container         *container.Manager
-	Firewall          *firewall.Manager
-	Lifecycle         *lifecycle.Manager
-	Creds             *sts.Provider
+	Client            AgentClient
+	Disk              DiskManager
+	Container         ContainerReconciler
+	Firewall          FirewallReconciler
+	HostSetup         HostSetup
+	Lifecycle         LifecycleManager
+	Creds             CredsProvider
 	Logger            *slog.Logger
 }
 
@@ -57,6 +94,9 @@ func New(cfg Config) *Agent {
 	if cfg.Container != nil {
 		cfg.Container.SetReporter(a.reportContainerPhase)
 	}
+	if cfg.HostSetup != nil {
+		cfg.HostSetup.SetReporter(a.reportSetupPhase)
+	}
 	return a
 }
 
@@ -75,6 +115,24 @@ func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContai
 	defer cancel()
 	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
 		a.cfg.Logger.Warn("container phase report failed", "state", obs.ObservedState, "err", err)
+	}
+}
+
+func (a *Agent) reportSetupPhase(ctx context.Context, obs client.AgentSetupObserved) {
+	if a.lastSpec == nil {
+		return
+	}
+	status := &client.AgentStatus{
+		ObservedGeneration: a.lastSpec.Generation,
+		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
+		Setup:              &obs,
+		AgentVersion:       a.cfg.Version,
+		UptimeSec:          int64(time.Since(a.started).Seconds()),
+	}
+	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
+		a.cfg.Logger.Warn("setup phase report failed", "state", obs.ObservedState, "err", err)
 	}
 }
 
@@ -224,8 +282,24 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 
 	var containerObserved *client.AgentContainerObserved
 	var firewallObserved *client.AgentFirewallObserved
+	var setupObserved *client.AgentSetupObserved
 	if spec.Lifecycle.DeletionRequestedAt == nil {
 		_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
+
+		if a.cfg.HostSetup != nil {
+			obs := a.cfg.HostSetup.Reconcile(ctx)
+			setupObserved = &obs
+			if obs.ObservedState != client.SetupReady {
+				return a.postStatus(ctx, &client.AgentStatus{
+					ObservedGeneration: spec.Generation,
+					Lifecycle:          client.StatusLifecycle{ObservedState: observedLifecycle},
+					Setup:              setupObserved,
+					AgentVersion:       a.cfg.Version,
+					UptimeSec:          int64(time.Since(a.started).Seconds()),
+				})
+			}
+		}
+
 		a.refreshCredsIfDiskSetChanged(ctx, spec)
 		disksObserved = a.reconcileDisks(ctx, spec)
 		if a.cfg.Container != nil {
@@ -238,15 +312,19 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		}
 	}
 
-	status := &client.AgentStatus{
+	return a.postStatus(ctx, &client.AgentStatus{
 		ObservedGeneration: spec.Generation,
 		Lifecycle:          client.StatusLifecycle{ObservedState: observedLifecycle},
 		Disks:              disksObserved,
 		Container:          containerObserved,
 		Firewall:           firewallObserved,
+		Setup:              setupObserved,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
-	}
+	})
+}
+
+func (a *Agent) postStatus(ctx context.Context, status *client.AgentStatus) error {
 	if err := a.cfg.Client.PostStatus(ctx, status); err != nil {
 		return fmt.Errorf("post status: %w", err)
 	}
