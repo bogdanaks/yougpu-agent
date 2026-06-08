@@ -23,6 +23,7 @@ const (
 	dockerTimeout   = 5 * time.Second
 	pullTimeout     = 10 * time.Minute
 	runTimeout      = 2 * time.Minute
+	reportThrottle  = 5 * time.Second
 	inspectNoExit   = "no such object"
 	inspectNotFound = "No such object"
 )
@@ -42,13 +43,25 @@ type Observed struct {
 }
 
 type Manager struct {
-	exec system.Executor
-	log  *slog.Logger
-	name string
+	exec     system.Executor
+	puller   Puller
+	reporter func(context.Context, client.AgentContainerObserved)
+	log      *slog.Logger
+	name     string
 }
 
-func NewManager(exec system.Executor, log *slog.Logger) *Manager {
-	return &Manager{exec: exec, log: log, name: containerName}
+func NewManager(exec system.Executor, puller Puller, log *slog.Logger) *Manager {
+	return &Manager{exec: exec, puller: puller, log: log, name: containerName}
+}
+
+func (m *Manager) SetReporter(fn func(context.Context, client.AgentContainerObserved)) {
+	m.reporter = fn
+}
+
+func (m *Manager) emit(ctx context.Context, obs client.AgentContainerObserved) {
+	if m.reporter != nil {
+		m.reporter(ctx, obs)
+	}
 }
 
 func SpecHash(spec *client.AgentContainerSpec) string {
@@ -172,13 +185,36 @@ func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, ha
 		}
 	}
 
-	if _, err := m.exec.Run(ctx, pullTimeout, "docker", "pull", spec.Image); err != nil {
+	m.emit(ctx, client.AgentContainerObserved{ObservedState: client.ContainerPulling, SpecHash: hash})
+
+	pullCtx, cancel := context.WithTimeout(ctx, pullTimeout)
+	defer cancel()
+	var lastLayers int
+	var lastReport time.Time
+	onProgress := func(pp PullProgress) {
+		now := time.Now()
+		if pp.LayersDone != lastLayers || now.Sub(lastReport) >= reportThrottle {
+			lastLayers = pp.LayersDone
+			lastReport = now
+			pct := pp.Percent
+			detail := fmt.Sprintf("%d/%d", pp.LayersDone, pp.LayersTotal)
+			m.emit(ctx, client.AgentContainerObserved{
+				ObservedState: client.ContainerPulling,
+				Progress:      &pct,
+				Detail:        &detail,
+				SpecHash:      hash,
+			})
+		}
+	}
+	if err := m.puller.Pull(pullCtx, spec.Image, onProgress); err != nil {
 		return fmt.Errorf("pull %s: %w", spec.Image, err)
 	}
 
 	if err := m.remove(ctx); err != nil {
 		return fmt.Errorf("remove old: %w", err)
 	}
+
+	m.emit(ctx, client.AgentContainerObserved{ObservedState: client.ContainerStarting, SpecHash: hash})
 
 	args := m.runArgs(spec, hash)
 	if _, err := m.exec.Run(ctx, runTimeout, "docker", args...); err != nil {

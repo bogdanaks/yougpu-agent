@@ -70,7 +70,7 @@ func main() {
 		diskMgr.SetDirectMode(true)
 		logger.Info("disk driver: direct (rclone --daemon, без systemd)")
 	}
-	containerMgr := container.NewManager(executor, logger)
+	containerMgr := container.NewManager(executor, container.NewSocketPuller(), logger)
 	firewallMgr := firewall.NewManager(executor, logger)
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
 	credsProvider := sts.NewProvider(httpClient, diskMgr, logger, cfg.CredsRefreshThreshold, cfg.CredsPeriodicInterval)

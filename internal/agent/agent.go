@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
@@ -47,10 +49,32 @@ func New(cfg Config) *Agent {
 	if cfg.ReconcileInterval == 0 {
 		cfg.ReconcileInterval = 60 * time.Second
 	}
-	return &Agent{
+	a := &Agent{
 		cfg:         cfg,
 		started:     time.Now(),
 		knownDiskID: map[string]bool{},
+	}
+	if cfg.Container != nil {
+		cfg.Container.SetReporter(a.reportContainerPhase)
+	}
+	return a
+}
+
+func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContainerObserved) {
+	if a.lastSpec == nil {
+		return
+	}
+	status := &client.AgentStatus{
+		ObservedGeneration: a.lastSpec.Generation,
+		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
+		Container:          &obs,
+		AgentVersion:       a.cfg.Version,
+		UptimeSec:          int64(time.Since(a.started).Seconds()),
+	}
+	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
+		a.cfg.Logger.Warn("container phase report failed", "state", obs.ObservedState, "err", err)
 	}
 }
 
@@ -70,7 +94,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer cancel()
 
 	if err := a.cfg.Creds.EnsureFresh(ctx); err != nil {
-		a.cfg.Logger.Error("initial credentials fetch failed", "err", err)
+		var httpErr *client.HTTPError
+		if errors.As(err, &httpErr) && httpErr.Status == http.StatusBadRequest {
+			a.cfg.Logger.Info("no storage drive attached; skipping initial credentials fetch")
+		} else {
+			a.cfg.Logger.Warn("initial credentials fetch failed; will retry in background", "err", err)
+		}
 	}
 
 	go a.cfg.Creds.Run(ctx)
@@ -203,7 +232,7 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 			obs := a.cfg.Container.Reconcile(ctx, spec.Container)
 			containerObserved = &obs
 		}
-		if a.cfg.Firewall != nil {
+		if a.cfg.Firewall != nil && spec.Firewall != nil {
 			obs := a.cfg.Firewall.Reconcile(ctx, spec.Firewall)
 			firewallObserved = &obs
 		}

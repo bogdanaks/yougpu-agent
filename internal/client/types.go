@@ -75,6 +75,8 @@ type AgentDiskObserved struct {
 
 type AgentContainerObserved struct {
 	ObservedState string  `json:"observed_state"`
+	Progress      *int    `json:"progress,omitempty"`
+	Detail        *string `json:"detail,omitempty"`
 	SpecHash      string  `json:"spec_hash,omitempty"`
 	LastError     *string `json:"last_error"`
 }
@@ -89,9 +91,11 @@ const (
 	ObservedUnmounted = "unmounted"
 	ObservedError     = "error"
 
-	ContainerRunning = "running"
-	ContainerAbsent  = "absent"
-	ContainerError   = "error"
+	ContainerPulling  = "pulling"
+	ContainerStarting = "starting"
+	ContainerRunning  = "running"
+	ContainerAbsent   = "absent"
+	ContainerError    = "error"
 
 	FirewallApplied = "applied"
 	FirewallError   = "error"
