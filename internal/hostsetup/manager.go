@@ -82,7 +82,6 @@ func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
 		if s.skip(ctx) {
 			if !m.reachedReady {
 				m.emit(ctx, client.AgentSetupObserved{ObservedState: s.phase, Progress: ptrInt(progress)})
-				m.log.Info("STAGETRACE host-setup step skipped (already satisfied)", "phase", s.phase, "step", i+1, "of", total)
 			}
 			continue
 		}
@@ -92,7 +91,6 @@ func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
 			m.log.Error("host-setup step failed", "phase", s.phase, "step", i+1, "of", total, "err", err)
 			return m.errorObserved(s.phase, err)
 		}
-		m.log.Info("STAGETRACE host-setup step done", "phase", s.phase, "step", i+1, "of", total)
 	}
 	m.reachedReady = true
 	m.log.Info("host-setup complete: host ready")
