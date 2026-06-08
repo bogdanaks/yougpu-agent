@@ -39,7 +39,8 @@ type Manager struct {
 	log      *slog.Logger
 	reporter func(context.Context, client.AgentSetupObserved)
 
-	lastOutput string
+	lastOutput   string
+	reachedReady bool
 
 	pollDelay    time.Duration
 	nvidiaTries  int
@@ -77,18 +78,23 @@ func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
 	steps := m.steps()
 	total := len(steps)
 	for i, s := range steps {
+		progress := i * 100 / total
 		if s.skip(ctx) {
-			m.log.Debug("host-setup step skipped", "phase", s.phase, "step", i+1, "of", total)
+			if !m.reachedReady {
+				m.emit(ctx, client.AgentSetupObserved{ObservedState: s.phase, Progress: ptrInt(progress)})
+				m.log.Info("STAGETRACE host-setup step skipped (already satisfied)", "phase", s.phase, "step", i+1, "of", total)
+			}
 			continue
 		}
-		progress := i * 100 / total
 		m.log.Info("host-setup step starting", "phase", s.phase, "step", i+1, "of", total, "progress", progress)
 		m.emit(ctx, client.AgentSetupObserved{ObservedState: s.phase, Progress: ptrInt(progress)})
 		if err := s.run(ctx); err != nil {
-			m.log.Error("host-setup step failed", "phase", s.phase, "err", err)
+			m.log.Error("host-setup step failed", "phase", s.phase, "step", i+1, "of", total, "err", err)
 			return m.errorObserved(s.phase, err)
 		}
+		m.log.Info("STAGETRACE host-setup step done", "phase", s.phase, "step", i+1, "of", total)
 	}
+	m.reachedReady = true
 	m.log.Info("host-setup complete: host ready")
 	return client.AgentSetupObserved{ObservedState: client.SetupReady, Progress: ptrInt(100)}
 }

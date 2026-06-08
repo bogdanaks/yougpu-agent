@@ -70,10 +70,11 @@ type Config struct {
 }
 
 type Agent struct {
-	cfg         Config
-	started     time.Time
-	knownDiskID map[string]bool
-	lastSpec    *client.AgentSpec
+	cfg               Config
+	started           time.Time
+	knownDiskID       map[string]bool
+	lastSpec          *client.AgentSpec
+	lastStatusSummary string
 }
 
 func New(cfg Config) *Agent {
@@ -111,6 +112,7 @@ func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContai
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	}
+	a.logStatus(status)
 	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
@@ -129,6 +131,7 @@ func (a *Agent) reportSetupPhase(ctx context.Context, obs client.AgentSetupObser
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	}
+	a.logStatus(status)
 	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
@@ -181,6 +184,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		case spec, ok := <-specs:
 			if !ok {
 				return nil
+			}
+			if a.lastSpec == nil || spec.Generation != a.lastSpec.Generation {
+				a.logSpec(spec)
 			}
 			a.lastSpec = spec
 			if err := a.handleSpec(ctx, spec); err != nil {
@@ -325,10 +331,54 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 }
 
 func (a *Agent) postStatus(ctx context.Context, status *client.AgentStatus) error {
+	a.logStatus(status)
 	if err := a.cfg.Client.PostStatus(ctx, status); err != nil {
 		return fmt.Errorf("post status: %w", err)
 	}
 	return nil
+}
+
+func statusSummary(s *client.AgentStatus) string {
+	setup, container, firewall := "-", "-", "-"
+	if s.Setup != nil {
+		setup = s.Setup.ObservedState
+	}
+	if s.Container != nil {
+		container = s.Container.ObservedState
+	}
+	if s.Firewall != nil {
+		firewall = s.Firewall.ObservedState
+	}
+	return fmt.Sprintf("gen=%d lifecycle=%s setup=%s container=%s firewall=%s disks=%d",
+		s.ObservedGeneration, s.Lifecycle.ObservedState, setup, container, firewall, len(s.Disks))
+}
+
+func (a *Agent) logStatus(status *client.AgentStatus) {
+	summary := statusSummary(status)
+	if summary == a.lastStatusSummary {
+		a.cfg.Logger.Debug("STAGETRACE posting status to backend (unchanged)", "status", summary)
+		return
+	}
+	a.lastStatusSummary = summary
+	a.cfg.Logger.Info("STAGETRACE posting status to backend", "status", summary)
+}
+
+func (a *Agent) logSpec(spec *client.AgentSpec) {
+	image := "none"
+	if spec.Container != nil {
+		image = spec.Container.Image
+	}
+	ports := 0
+	if spec.Firewall != nil {
+		ports = len(spec.Firewall.Ports)
+	}
+	a.cfg.Logger.Info("STAGETRACE spec received from backend",
+		"generation", spec.Generation,
+		"container_image", image,
+		"firewall_ports", ports,
+		"disks", len(spec.Disks),
+		"deletion_requested", spec.Lifecycle.DeletionRequestedAt != nil,
+	)
 }
 
 func (a *Agent) refreshCredsIfDiskSetChanged(ctx context.Context, spec *client.AgentSpec) {

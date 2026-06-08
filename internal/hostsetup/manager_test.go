@@ -17,21 +17,18 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// fakeExec is a scriptable system.Executor mirroring the firewall/manager_test convention.
-// It distinguishes skip-probes (command -v, docker info, rclone version, lspci, grep fuse.conf)
-// from mutating run() commands so a single Reconcile pass can be asserted by its recorded calls.
 type fakeExec struct {
 	calls *[]string
 
-	present       map[string]bool // results of `command -v <name>`
-	gpu           bool            // `lspci | grep -i nvidia` finds a card
-	dockerUp      bool            // `docker info` succeeds
-	rcloneOK      bool            // `rclone version` succeeds
-	fuseOK        bool            // fuse.conf already has user_allow_other
-	aptLockFree   bool            // fuser reports no lock holder
-	nvidiaRuntime []bool          // successive `docker info --format` runtime probes (last repeats)
+	present       map[string]bool
+	gpu           bool
+	dockerUp      bool
+	rcloneOK      bool
+	fuseOK        bool
+	aptLockFree   bool
+	nvidiaRuntime []bool
 	nvidiaProbes  int
-	failContains  string // any run script containing this fails
+	failContains  string
 }
 
 func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
@@ -60,7 +57,6 @@ func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...
 		return "", errors.New("no nvidia on pci bus")
 
 	case strings.Contains(script, "user_allow_other") && !strings.Contains(script, "echo"):
-		// pure `grep -q ... /etc/fuse.conf` skip-probe (the mutating run uses `|| echo`)
 		if f.fuseOK {
 			return "", nil
 		}
@@ -196,7 +192,7 @@ func TestReconcileDockerHardResetAndRuntimeWait(t *testing.T) {
 		rcloneOK:      true,
 		fuseOK:        true,
 		aptLockFree:   true,
-		nvidiaRuntime: []bool{false, false, true}, // appears on 3rd probe
+		nvidiaRuntime: []bool{false, false, true},
 	}
 	obs := newManager(fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
@@ -216,7 +212,7 @@ func TestReconcileNvidiaRuntimeNeverAppearsIsError(t *testing.T) {
 		rcloneOK:      true,
 		fuseOK:        true,
 		aptLockFree:   true,
-		nvidiaRuntime: []bool{false}, // never appears
+		nvidiaRuntime: []bool{false},
 	}
 	obs := newManager(fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupError {
@@ -231,7 +227,7 @@ func TestReconcileStopsOnFirstErrorAndReportsBundle(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
 		calls:        &calls,
-		present:      map[string]bool{"lspci": true}, // gpg/unzip missing → base-deps runs
+		present:      map[string]bool{"lspci": true},
 		dockerUp:     true,
 		failContains: "apt-get install -y gnupg",
 	}
