@@ -3,13 +3,38 @@ package client
 import "time"
 
 type AgentSpec struct {
-	Generation int64           `json:"generation"`
-	Lifecycle  SpecLifecycle   `json:"lifecycle"`
-	Disks      []AgentDiskSpec `json:"disks"`
+	Generation int64               `json:"generation"`
+	Lifecycle  SpecLifecycle       `json:"lifecycle"`
+	Container  *AgentContainerSpec `json:"container"`
+	Firewall   *AgentFirewallSpec  `json:"firewall"`
+	Disks      []AgentDiskSpec     `json:"disks"`
+}
+
+type AgentFirewallSpec struct {
+	Ports []FirewallPort `json:"ports"`
+}
+
+type FirewallPort struct {
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"`
 }
 
 type SpecLifecycle struct {
 	DeletionRequestedAt *string `json:"deletion_requested_at"`
+}
+
+type AgentContainerSpec struct {
+	Image      string            `json:"image"`
+	RunCommand *string           `json:"run_command"`
+	Env        map[string]string `json:"env"`
+	Volumes    []ContainerVolume `json:"volumes"`
+	ShmSizeGB  *float64          `json:"shm_size_gb"`
+	GPU        bool              `json:"gpu"`
+}
+
+type ContainerVolume struct {
+	Host      string `json:"host"`
+	Container string `json:"container"`
 }
 
 type AgentDiskSpec struct {
@@ -26,14 +51,16 @@ const (
 )
 
 type AgentStatus struct {
-	ObservedGeneration int64               `json:"observed_generation"`
-	Lifecycle          StatusLifecycle     `json:"lifecycle"`
+	ObservedGeneration int64           `json:"observed_generation"`
+	Lifecycle          StatusLifecycle `json:"lifecycle"`
 	// omitempty: nil-slice сериализуется в `null`, что валит Zod-валидацию backend'а
 	// (она ожидает массив или missing — null нелегитимен). Пустой массив тоже устроит,
 	// но omitempty короче и совпадает с DTO-дефолтом backend'а (.default([])).
-	Disks        []AgentDiskObserved `json:"disks,omitempty"`
-	AgentVersion string              `json:"agent_version,omitempty"`
-	UptimeSec    int64               `json:"uptime_sec,omitempty"`
+	Disks        []AgentDiskObserved     `json:"disks,omitempty"`
+	Container    *AgentContainerObserved `json:"container,omitempty"`
+	Firewall     *AgentFirewallObserved  `json:"firewall,omitempty"`
+	AgentVersion string                  `json:"agent_version,omitempty"`
+	UptimeSec    int64                   `json:"uptime_sec,omitempty"`
 }
 
 type StatusLifecycle struct {
@@ -46,10 +73,28 @@ type AgentDiskObserved struct {
 	LastError     *string `json:"last_error"`
 }
 
+type AgentContainerObserved struct {
+	ObservedState string  `json:"observed_state"`
+	SpecHash      string  `json:"spec_hash,omitempty"`
+	LastError     *string `json:"last_error"`
+}
+
+type AgentFirewallObserved struct {
+	ObservedState string  `json:"observed_state"`
+	LastError     *string `json:"last_error"`
+}
+
 const (
 	ObservedMounted   = "mounted"
 	ObservedUnmounted = "unmounted"
 	ObservedError     = "error"
+
+	ContainerRunning = "running"
+	ContainerAbsent  = "absent"
+	ContainerError   = "error"
+
+	FirewallApplied = "applied"
+	FirewallError   = "error"
 
 	LifecycleAlive          = "alive"
 	LifecycleSyncing        = "syncing"

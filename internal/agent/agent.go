@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/container"
 	"github.com/bogdanaks/yougpu-agent/internal/disk"
+	"github.com/bogdanaks/yougpu-agent/internal/firewall"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/reconcile"
 	"github.com/bogdanaks/yougpu-agent/internal/sts"
@@ -21,6 +23,8 @@ type Config struct {
 	ReconcileInterval time.Duration
 	Client            *client.Client
 	Disk              *disk.Manager
+	Container         *container.Manager
+	Firewall          *firewall.Manager
 	Lifecycle         *lifecycle.Manager
 	Creds             *sts.Provider
 	Logger            *slog.Logger
@@ -187,16 +191,30 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 			a.cfg.Logger.Error("termination handling failed", "err", err)
 		}
 		observedLifecycle = state
-	} else {
+	}
+
+	var containerObserved *client.AgentContainerObserved
+	var firewallObserved *client.AgentFirewallObserved
+	if spec.Lifecycle.DeletionRequestedAt == nil {
 		_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
 		a.refreshCredsIfDiskSetChanged(ctx, spec)
 		disksObserved = a.reconcileDisks(ctx, spec)
+		if a.cfg.Container != nil {
+			obs := a.cfg.Container.Reconcile(ctx, spec.Container)
+			containerObserved = &obs
+		}
+		if a.cfg.Firewall != nil {
+			obs := a.cfg.Firewall.Reconcile(ctx, spec.Firewall)
+			firewallObserved = &obs
+		}
 	}
 
 	status := &client.AgentStatus{
 		ObservedGeneration: spec.Generation,
 		Lifecycle:          client.StatusLifecycle{ObservedState: observedLifecycle},
 		Disks:              disksObserved,
+		Container:          containerObserved,
+		Firewall:           firewallObserved,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	}
