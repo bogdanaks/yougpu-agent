@@ -36,6 +36,10 @@ type FirewallReconciler interface {
 	Reconcile(ctx context.Context, spec *client.AgentFirewallSpec) client.AgentFirewallObserved
 }
 
+type TunnelReconciler interface {
+	Reconcile(ctx context.Context, spec *client.AgentTunnelSpec)
+}
+
 type HostSetup interface {
 	Reconcile(ctx context.Context) client.AgentSetupObserved
 	SetReporter(func(context.Context, client.AgentSetupObserved))
@@ -63,6 +67,7 @@ type Config struct {
 	Disk              DiskManager
 	Container         ContainerReconciler
 	Firewall          FirewallReconciler
+	Tunnel            TunnelReconciler
 	HostSetup         HostSetup
 	Lifecycle         LifecycleManager
 	Creds             CredsProvider
@@ -309,6 +314,9 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		if a.cfg.Firewall != nil && spec.Firewall != nil {
 			obs := a.cfg.Firewall.Reconcile(ctx, spec.Firewall)
 			firewallObserved = &obs
+		}
+		if a.cfg.Tunnel != nil {
+			a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
 		}
 	}
 

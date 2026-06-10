@@ -20,6 +20,7 @@ import (
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/sts"
 	"github.com/bogdanaks/yougpu-agent/internal/system"
+	"github.com/bogdanaks/yougpu-agent/internal/tunnel"
 )
 
 var version = "dev"
@@ -73,6 +74,7 @@ func main() {
 	}
 	containerMgr := container.NewManager(executor, container.NewSocketPuller(), logger)
 	firewallMgr := firewall.NewManager(executor, logger)
+	tunnelMgr := tunnel.NewManager(logger)
 	hostSetupMgr := hostsetup.NewManager(executor, systemd, logger)
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
 	credsProvider := sts.NewProvider(httpClient, diskMgr, logger, cfg.CredsRefreshThreshold, cfg.CredsPeriodicInterval)
@@ -86,6 +88,7 @@ func main() {
 		Disk:              diskMgr,
 		Container:         containerMgr,
 		Firewall:          firewallMgr,
+		Tunnel:            tunnelMgr,
 		HostSetup:         hostSetupMgr,
 		Lifecycle:         lifecycleMgr,
 		Creds:             credsProvider,

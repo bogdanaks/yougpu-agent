@@ -7,6 +7,7 @@ type AgentSpec struct {
 	Lifecycle  SpecLifecycle       `json:"lifecycle"`
 	Container  *AgentContainerSpec `json:"container"`
 	Firewall   *AgentFirewallSpec  `json:"firewall"`
+	Tunnel     *AgentTunnelSpec    `json:"tunnel"`
 	Disks      []AgentDiskSpec     `json:"disks"`
 }
 
@@ -17,6 +18,18 @@ type AgentFirewallSpec struct {
 type FirewallPort struct {
 	Port     int    `json:"port"`
 	Protocol string `json:"protocol"`
+}
+
+type AgentTunnelSpec struct {
+	Slug     string        `json:"slug"`
+	FrpsAddr string        `json:"frps_addr"`
+	FrpToken string        `json:"frp_token"`
+	Proxies  []TunnelProxy `json:"proxies"`
+}
+
+type TunnelProxy struct {
+	Subdomain string `json:"subdomain"`
+	LocalPort int    `json:"local_port"`
 }
 
 type SpecLifecycle struct {
