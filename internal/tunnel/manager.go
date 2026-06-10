@@ -108,6 +108,7 @@ func buildConfig(spec *client.AgentTunnelSpec) (*v1.ClientCommonConfig, []v1.Pro
 		cfg.LocalIP = "127.0.0.1"
 		cfg.LocalPort = p.LocalPort
 		cfg.SubDomain = p.Subdomain
+		cfg.Transport.UseCompression = true
 		cfg.Complete("")
 		proxies = append(proxies, cfg)
 	}
