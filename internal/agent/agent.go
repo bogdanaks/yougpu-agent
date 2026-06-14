@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/reconcile"
+)
+
+const (
+	containerReadyTimeout       = 3 * time.Minute
+	containerReadyProbeInterval = 2 * time.Second
+	endpointDialTimeout         = 2 * time.Second
 )
 
 type AgentClient interface {
@@ -38,6 +46,7 @@ type FirewallReconciler interface {
 
 type TunnelReconciler interface {
 	Reconcile(ctx context.Context, spec *client.AgentTunnelSpec)
+	Ready(subdomains []string) bool
 }
 
 type HostSetup interface {
@@ -75,10 +84,11 @@ type Config struct {
 }
 
 type Agent struct {
-	cfg         Config
-	started     time.Time
-	knownDiskID map[string]bool
-	lastSpec    *client.AgentSpec
+	cfg                Config
+	started            time.Time
+	knownDiskID        map[string]bool
+	lastSpec           *client.AgentSpec
+	containerReadyHash string
 }
 
 func New(cfg Config) *Agent {
@@ -318,6 +328,11 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		if a.cfg.Tunnel != nil {
 			a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
 		}
+		if containerObserved != nil && containerObserved.ObservedState == client.ContainerRunning {
+			if a.ensureContainerReady(ctx, spec, containerObserved.SpecHash) {
+				containerObserved.ObservedState = client.ContainerReady
+			}
+		}
 	}
 
 	return a.postStatus(ctx, &client.AgentStatus{
@@ -330,6 +345,50 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	})
+}
+
+func (a *Agent) ensureContainerReady(ctx context.Context, spec *client.AgentSpec, hash string) bool {
+	if spec.Container == nil || spec.Tunnel == nil || len(spec.Tunnel.Proxies) == 0 {
+		return true
+	}
+	if hash != "" && a.containerReadyHash == hash {
+		return true
+	}
+
+	subdomains := make([]string, 0, len(spec.Tunnel.Proxies))
+	for _, p := range spec.Tunnel.Proxies {
+		subdomains = append(subdomains, p.Subdomain)
+	}
+
+	deadline := time.Now().Add(containerReadyTimeout)
+	for {
+		if a.endpointsListening(spec.Tunnel.Proxies) && a.cfg.Tunnel.Ready(subdomains) {
+			a.containerReadyHash = hash
+			a.cfg.Logger.Info("container endpoints reachable; marking ready", "proxies", len(subdomains))
+			return true
+		}
+		if time.Now().After(deadline) {
+			a.containerReadyHash = hash
+			a.cfg.Logger.Warn("container readiness timed out; marking ready (degraded)", "proxies", len(subdomains))
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(containerReadyProbeInterval):
+		}
+	}
+}
+
+func (a *Agent) endpointsListening(proxies []client.TunnelProxy) bool {
+	for _, p := range proxies {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p.LocalPort)), endpointDialTimeout)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+	}
+	return true
 }
 
 func (a *Agent) postStatus(ctx context.Context, status *client.AgentStatus) error {

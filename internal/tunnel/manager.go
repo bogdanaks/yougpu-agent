@@ -22,6 +22,7 @@ type Manager struct {
 	mu     sync.Mutex
 	hash   string
 	cancel context.CancelFunc
+	svc    *frpclient.Service
 }
 
 func NewManager(log *slog.Logger) *Manager {
@@ -57,6 +58,24 @@ func (m *Manager) stopLocked() {
 	m.cancel()
 	m.cancel = nil
 	m.hash = ""
+	m.svc = nil
+}
+
+func (m *Manager) Ready(subdomains []string) bool {
+	m.mu.Lock()
+	svc := m.svc
+	m.mu.Unlock()
+	if svc == nil {
+		return false
+	}
+	exporter := svc.StatusExporter()
+	for _, name := range subdomains {
+		ws, ok := exporter.GetProxyStatus(name)
+		if !ok || ws.Phase != "running" {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) startLocked(ctx context.Context, spec *client.AgentTunnelSpec, hash string) error {
@@ -73,6 +92,7 @@ func (m *Manager) startLocked(ctx context.Context, spec *client.AgentTunnelSpec,
 	svcCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 	m.hash = hash
+	m.svc = svc
 
 	go func() {
 		if runErr := svc.Run(svcCtx); runErr != nil && svcCtx.Err() == nil {

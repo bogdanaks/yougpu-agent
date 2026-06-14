@@ -220,6 +220,8 @@ func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, ha
 	if _, err := m.exec.Run(ctx, runTimeout, "docker", args...); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
+
+	m.emit(ctx, client.AgentContainerObserved{ObservedState: client.ContainerRunning, SpecHash: hash})
 	return nil
 }
 

@@ -116,6 +116,7 @@ const (
 	ContainerPulling  = "pulling"
 	ContainerStarting = "starting"
 	ContainerRunning  = "running"
+	ContainerReady    = "ready"
 	ContainerAbsent   = "absent"
 	ContainerError    = "error"
 
