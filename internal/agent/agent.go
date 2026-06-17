@@ -49,6 +49,11 @@ type TunnelReconciler interface {
 	Ready(subdomains []string) bool
 }
 
+type EdgeReconciler interface {
+	Reconcile(ctx context.Context, spec *client.AgentAccessSpec)
+	Ready() bool
+}
+
 type HostSetup interface {
 	Reconcile(ctx context.Context) client.AgentSetupObserved
 	SetReporter(func(context.Context, client.AgentSetupObserved))
@@ -77,6 +82,7 @@ type Config struct {
 	Container         ContainerReconciler
 	Firewall          FirewallReconciler
 	Tunnel            TunnelReconciler
+	Edge              EdgeReconciler
 	HostSetup         HostSetup
 	Lifecycle         LifecycleManager
 	Creds             CredsProvider
@@ -328,6 +334,9 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		if a.cfg.Tunnel != nil {
 			a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
 		}
+		if a.cfg.Edge != nil {
+			a.cfg.Edge.Reconcile(ctx, spec.Access)
+		}
 		if containerObserved != nil && containerObserved.ObservedState == client.ContainerRunning {
 			if a.ensureContainerReady(ctx, spec, containerObserved.SpecHash) {
 				containerObserved.ObservedState = client.ContainerReady
@@ -348,28 +357,27 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 }
 
 func (a *Agent) ensureContainerReady(ctx context.Context, spec *client.AgentSpec, hash string) bool {
-	if spec.Container == nil || spec.Tunnel == nil || len(spec.Tunnel.Proxies) == 0 {
+	if spec.Container == nil {
+		return true
+	}
+	ports, ready := a.readinessTargets(spec)
+	if len(ports) == 0 {
 		return true
 	}
 	if hash != "" && a.containerReadyHash == hash {
 		return true
 	}
 
-	subdomains := make([]string, 0, len(spec.Tunnel.Proxies))
-	for _, p := range spec.Tunnel.Proxies {
-		subdomains = append(subdomains, p.Subdomain)
-	}
-
 	deadline := time.Now().Add(containerReadyTimeout)
 	for {
-		if a.endpointsListening(spec.Tunnel.Proxies) && a.cfg.Tunnel.Ready(subdomains) {
+		if a.portsListening(ports) && ready() {
 			a.containerReadyHash = hash
-			a.cfg.Logger.Info("container endpoints reachable; marking ready", "proxies", len(subdomains))
+			a.cfg.Logger.Info("container endpoints reachable; marking ready", "endpoints", len(ports))
 			return true
 		}
 		if time.Now().After(deadline) {
 			a.containerReadyHash = hash
-			a.cfg.Logger.Warn("container readiness timed out; marking ready (degraded)", "proxies", len(subdomains))
+			a.cfg.Logger.Warn("container readiness timed out; marking ready (degraded)", "endpoints", len(ports))
 			return true
 		}
 		select {
@@ -380,9 +388,33 @@ func (a *Agent) ensureContainerReady(ctx context.Context, spec *client.AgentSpec
 	}
 }
 
-func (a *Agent) endpointsListening(proxies []client.TunnelProxy) bool {
-	for _, p := range proxies {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p.LocalPort)), endpointDialTimeout)
+func (a *Agent) readinessTargets(spec *client.AgentSpec) ([]int, func() bool) {
+	if spec.Access != nil && len(spec.Access.Endpoints) > 0 {
+		ports := make([]int, 0, len(spec.Access.Endpoints))
+		for _, ep := range spec.Access.Endpoints {
+			ports = append(ports, ep.Port)
+		}
+		return ports, func() bool {
+			return a.cfg.Edge != nil && a.cfg.Edge.Ready()
+		}
+	}
+	if spec.Tunnel != nil && len(spec.Tunnel.Proxies) > 0 {
+		ports := make([]int, 0, len(spec.Tunnel.Proxies))
+		subdomains := make([]string, 0, len(spec.Tunnel.Proxies))
+		for _, p := range spec.Tunnel.Proxies {
+			ports = append(ports, p.LocalPort)
+			subdomains = append(subdomains, p.Subdomain)
+		}
+		return ports, func() bool {
+			return a.cfg.Tunnel != nil && a.cfg.Tunnel.Ready(subdomains)
+		}
+	}
+	return nil, func() bool { return true }
+}
+
+func (a *Agent) portsListening(ports []int) bool {
+	for _, port := range ports {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), endpointDialTimeout)
 		if err != nil {
 			return false
 		}

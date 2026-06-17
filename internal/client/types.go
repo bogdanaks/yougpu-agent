@@ -8,6 +8,7 @@ type AgentSpec struct {
 	Container  *AgentContainerSpec `json:"container"`
 	Firewall   *AgentFirewallSpec  `json:"firewall"`
 	Tunnel     *AgentTunnelSpec    `json:"tunnel"`
+	Access     *AgentAccessSpec    `json:"access"`
 	Disks      []AgentDiskSpec     `json:"disks"`
 }
 
@@ -31,6 +32,26 @@ type TunnelProxy struct {
 	Subdomain string `json:"subdomain"`
 	LocalPort int    `json:"local_port"`
 }
+
+type AgentAccessSpec struct {
+	Slug           string           `json:"slug"`
+	Token          string           `json:"token"`
+	CertPEM        string           `json:"cert_pem"`
+	KeyPEM         string           `json:"key_pem"`
+	Endpoints      []AccessEndpoint `json:"endpoints"`
+	FrameAncestors []string         `json:"frame_ancestors"`
+}
+
+type AccessEndpoint struct {
+	Key        string `json:"key"`
+	Port       int    `json:"port"`
+	Visibility string `json:"visibility"`
+}
+
+const (
+	VisibilityPrivate = "private"
+	VisibilityPublic  = "public"
+)
 
 type SpecLifecycle struct {
 	DeletionRequestedAt *string `json:"deletion_requested_at"`
