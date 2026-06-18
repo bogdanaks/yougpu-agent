@@ -49,11 +49,6 @@ type TunnelReconciler interface {
 	Ready(subdomains []string) bool
 }
 
-type EdgeReconciler interface {
-	Reconcile(ctx context.Context, spec *client.AgentAccessSpec)
-	Ready() bool
-}
-
 type HostSetup interface {
 	Reconcile(ctx context.Context) client.AgentSetupObserved
 	SetReporter(func(context.Context, client.AgentSetupObserved))
@@ -82,7 +77,6 @@ type Config struct {
 	Container         ContainerReconciler
 	Firewall          FirewallReconciler
 	Tunnel            TunnelReconciler
-	Edge              EdgeReconciler
 	HostSetup         HostSetup
 	Lifecycle         LifecycleManager
 	Creds             CredsProvider
@@ -334,9 +328,6 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		if a.cfg.Tunnel != nil {
 			a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
 		}
-		if a.cfg.Edge != nil {
-			a.cfg.Edge.Reconcile(ctx, spec.Access)
-		}
 		if containerObserved != nil && containerObserved.ObservedState == client.ContainerRunning {
 			if a.ensureContainerReady(ctx, spec, containerObserved.SpecHash) {
 				containerObserved.ObservedState = client.ContainerReady
@@ -389,15 +380,6 @@ func (a *Agent) ensureContainerReady(ctx context.Context, spec *client.AgentSpec
 }
 
 func (a *Agent) readinessTargets(spec *client.AgentSpec) ([]int, func() bool) {
-	if spec.Access != nil && len(spec.Access.Endpoints) > 0 {
-		ports := make([]int, 0, len(spec.Access.Endpoints))
-		for _, ep := range spec.Access.Endpoints {
-			ports = append(ports, ep.Port)
-		}
-		return ports, func() bool {
-			return a.cfg.Edge != nil && a.cfg.Edge.Ready()
-		}
-	}
 	if spec.Tunnel != nil && len(spec.Tunnel.Proxies) > 0 {
 		ports := make([]int, 0, len(spec.Tunnel.Proxies))
 		subdomains := make([]string, 0, len(spec.Tunnel.Proxies))
