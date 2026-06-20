@@ -8,7 +8,36 @@ type AgentSpec struct {
 	Container  *AgentContainerSpec `json:"container"`
 	Firewall   *AgentFirewallSpec  `json:"firewall"`
 	Tunnel     *AgentTunnelSpec    `json:"tunnel"`
+	Content    *AgentContentSpec   `json:"content"`
 	Disks      []AgentDiskSpec     `json:"disks"`
+}
+
+type AgentContentSpec struct {
+	WorkspaceFiles []ContentFile  `json:"workspace_files,omitempty"`
+	Models         []ContentModel `json:"models,omitempty"`
+	Dirs           []string       `json:"dirs,omitempty"`
+	Repos          []ContentRepo  `json:"repos,omitempty"`
+}
+
+type ContentRepo struct {
+	URL  string `json:"url"`
+	Ref  string `json:"ref,omitempty"`
+	Dest string `json:"dest"`
+}
+
+type ContentFile struct {
+	URL     string `json:"url,omitempty"`
+	Content string `json:"content,omitempty"`
+	Dest    string `json:"dest"`
+	Name    string `json:"name,omitempty"`
+}
+
+type ContentModel struct {
+	URL       string `json:"url"`
+	Type      string `json:"type"`
+	Name      string `json:"name,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
 }
 
 type AgentFirewallSpec struct {
@@ -73,6 +102,7 @@ type AgentStatus struct {
 	Container    *AgentContainerObserved `json:"container,omitempty"`
 	Firewall     *AgentFirewallObserved  `json:"firewall,omitempty"`
 	Setup        *AgentSetupObserved     `json:"setup,omitempty"`
+	Content      *AgentContentObserved   `json:"content,omitempty"`
 	AgentVersion string                  `json:"agent_version,omitempty"`
 	UptimeSec    int64                   `json:"uptime_sec,omitempty"`
 }
@@ -108,6 +138,13 @@ type AgentSetupObserved struct {
 	LastLog       *string `json:"last_log,omitempty"`
 }
 
+type AgentContentObserved struct {
+	ObservedState string  `json:"observed_state"`
+	Progress      *int    `json:"progress,omitempty"`
+	Detail        *string `json:"detail,omitempty"`
+	LastError     *string `json:"last_error,omitempty"`
+}
+
 const (
 	ObservedMounted   = "mounted"
 	ObservedUnmounted = "unmounted"
@@ -129,6 +166,10 @@ const (
 	SetupInstallingStorage = "installing_storage"
 	SetupReady             = "ready"
 	SetupError             = "error"
+
+	ContentDownloading = "downloading"
+	ContentReady       = "ready"
+	ContentError       = "error"
 
 	LifecycleAlive          = "alive"
 	LifecycleSyncing        = "syncing"

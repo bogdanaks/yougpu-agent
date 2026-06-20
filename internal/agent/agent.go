@@ -54,6 +54,11 @@ type HostSetup interface {
 	SetReporter(func(context.Context, client.AgentSetupObserved))
 }
 
+type ContentReconciler interface {
+	Reconcile(ctx context.Context, spec *client.AgentContentSpec, container *client.AgentContainerSpec) client.AgentContentObserved
+	SetReporter(func(context.Context, client.AgentContentObserved))
+}
+
 type LifecycleManager interface {
 	CurrentState() string
 	SetState(state string) error
@@ -78,6 +83,7 @@ type Config struct {
 	Firewall          FirewallReconciler
 	Tunnel            TunnelReconciler
 	HostSetup         HostSetup
+	Content           ContentReconciler
 	Lifecycle         LifecycleManager
 	Creds             CredsProvider
 	Logger            *slog.Logger
@@ -111,6 +117,9 @@ func New(cfg Config) *Agent {
 	}
 	if cfg.HostSetup != nil {
 		cfg.HostSetup.SetReporter(a.reportSetupPhase)
+	}
+	if cfg.Content != nil {
+		cfg.Content.SetReporter(a.reportContentPhase)
 	}
 	return a
 }
@@ -148,6 +157,24 @@ func (a *Agent) reportSetupPhase(ctx context.Context, obs client.AgentSetupObser
 	defer cancel()
 	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
 		a.cfg.Logger.Warn("setup phase report failed", "state", obs.ObservedState, "err", err)
+	}
+}
+
+func (a *Agent) reportContentPhase(ctx context.Context, obs client.AgentContentObserved) {
+	if a.lastSpec == nil {
+		return
+	}
+	status := &client.AgentStatus{
+		ObservedGeneration: a.lastSpec.Generation,
+		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
+		Content:            &obs,
+		AgentVersion:       a.cfg.Version,
+		UptimeSec:          int64(time.Since(a.started).Seconds()),
+	}
+	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
+		a.cfg.Logger.Warn("content phase report failed", "state", obs.ObservedState, "err", err)
 	}
 }
 
@@ -298,6 +325,7 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	var containerObserved *client.AgentContainerObserved
 	var firewallObserved *client.AgentFirewallObserved
 	var setupObserved *client.AgentSetupObserved
+	var contentObserved *client.AgentContentObserved
 	if spec.Lifecycle.DeletionRequestedAt == nil {
 		_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
 
@@ -317,6 +345,16 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 
 		a.refreshCredsIfDiskSetChanged(ctx, spec)
 		disksObserved = a.reconcileDisks(ctx, spec)
+		// App-контент (workflow + модели) кладём в /workspace ДО старта контейнера, чтобы
+		// ComfyUI на первом запуске уже видел граф и веса. Ошибка докачки не блокирует контейнер —
+		// репортим content=error и поднимаем приложение (degraded), а не бриковаем инстанс.
+		if a.cfg.Content != nil && spec.Content != nil {
+			obs := a.cfg.Content.Reconcile(ctx, spec.Content, spec.Container)
+			contentObserved = &obs
+			if obs.ObservedState == client.ContentError {
+				a.cfg.Logger.Error("content reconcile failed", "err", deref(obs.LastError))
+			}
+		}
 		if a.cfg.Container != nil {
 			obs := a.cfg.Container.Reconcile(ctx, spec.Container)
 			containerObserved = &obs
@@ -342,9 +380,17 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		Container:          containerObserved,
 		Firewall:           firewallObserved,
 		Setup:              setupObserved,
+		Content:            contentObserved,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	})
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (a *Agent) ensureContainerReady(ctx context.Context, spec *client.AgentSpec, hash string) bool {

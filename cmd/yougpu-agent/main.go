@@ -14,6 +14,7 @@ import (
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 	"github.com/bogdanaks/yougpu-agent/internal/config"
 	"github.com/bogdanaks/yougpu-agent/internal/container"
+	"github.com/bogdanaks/yougpu-agent/internal/content"
 	"github.com/bogdanaks/yougpu-agent/internal/disk"
 	"github.com/bogdanaks/yougpu-agent/internal/firewall"
 	"github.com/bogdanaks/yougpu-agent/internal/hostsetup"
@@ -76,6 +77,7 @@ func main() {
 	firewallMgr := firewall.NewManager(executor, logger)
 	tunnelMgr := tunnel.NewManager(logger)
 	hostSetupMgr := hostsetup.NewManager(executor, systemd, logger)
+	contentMgr := content.New(logger)
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
 	credsProvider := sts.NewProvider(httpClient, diskMgr, logger, cfg.CredsRefreshThreshold, cfg.CredsPeriodicInterval)
 
@@ -90,6 +92,7 @@ func main() {
 		Firewall:          firewallMgr,
 		Tunnel:            tunnelMgr,
 		HostSetup:         hostSetupMgr,
+		Content:           contentMgr,
 		Lifecycle:         lifecycleMgr,
 		Creds:             credsProvider,
 		Logger:            logger,
