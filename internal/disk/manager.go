@@ -327,14 +327,14 @@ func (m *Manager) writeRcloneConfig(c *client.StorageCredentials) error {
 	}
 	body := fmt.Sprintf(`[%s]
 type = s3
-provider = Minio
+provider = Other
 env_auth = false
 access_key_id = %s
 secret_access_key = %s
-session_token = %s
 endpoint = %s
+force_path_style = false
 acl = private
-`, rcloneRemote, c.AccessKey, c.SecretKey, c.SessionToken, c.Endpoint)
+`, rcloneRemote, c.AccessKey, c.SecretKey, c.Endpoint)
 
 	tmp := m.rcloneConfigPath + ".tmp"
 	if err := os.WriteFile(tmp, []byte(body), configFileMode); err != nil {
@@ -348,12 +348,12 @@ func (m *Manager) rcReload(ctx context.Context, port int, creds *client.StorageC
 		"name": rcloneRemote,
 		"parameters": map[string]string{
 			"type":              "s3",
-			"provider":          "Minio",
+			"provider":          "Other",
 			"env_auth":          "false",
 			"access_key_id":     creds.AccessKey,
 			"secret_access_key": creds.SecretKey,
-			"session_token":     creds.SessionToken,
 			"endpoint":          creds.Endpoint,
+			"force_path_style":  "false",
 			"acl":               "private",
 		},
 	}

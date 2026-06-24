@@ -181,7 +181,6 @@ type StorageCredentials struct {
 	Endpoint     string    `json:"endpoint"`
 	AccessKey    string    `json:"accessKey"`
 	SecretKey    string    `json:"secretKey"`
-	SessionToken string    `json:"sessionToken"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 	CredentialID string    `json:"credentialId"`
 }
