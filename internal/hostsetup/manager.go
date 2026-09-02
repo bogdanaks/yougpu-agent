@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	aptTimeout      = 5 * time.Minute
-	dockerInstallTO = 5 * time.Minute
+	aptTimeout      = 10 * time.Minute
+	aptLockTimeoutS = 300
+	aptConfPath     = "/etc/apt/apt.conf.d/99yougpu-provisioning"
+	dockerInstallTO = 10 * time.Minute
 	dockerInfoTO    = 15 * time.Second
 	cmdTimeout      = 30 * time.Second
 	downloadTimeout = 5 * time.Minute
@@ -22,9 +24,10 @@ const (
 	maxLastError    = 1024
 	maxLogTail      = 4096
 
-	defaultNvidiaTries  = 30
-	defaultAptLockTries = 150
-	defaultPollDelay    = 2 * time.Second
+	defaultNvidiaTries   = 30
+	defaultAptTries      = 3
+	defaultAptRetryDelay = 15 * time.Second
+	defaultPollDelay     = 2 * time.Second
 )
 
 type step struct {
@@ -42,19 +45,21 @@ type Manager struct {
 	lastOutput   string
 	reachedReady bool
 
-	pollDelay    time.Duration
-	nvidiaTries  int
-	aptLockTries int
+	pollDelay     time.Duration
+	nvidiaTries   int
+	aptTries      int
+	aptRetryDelay time.Duration
 }
 
 func NewManager(exec system.Executor, systemd system.Systemd, log *slog.Logger) *Manager {
 	return &Manager{
-		exec:         exec,
-		systemd:      systemd,
-		log:          log,
-		pollDelay:    defaultPollDelay,
-		nvidiaTries:  defaultNvidiaTries,
-		aptLockTries: defaultAptLockTries,
+		exec:          exec,
+		systemd:       systemd,
+		log:           log,
+		pollDelay:     defaultPollDelay,
+		nvidiaTries:   defaultNvidiaTries,
+		aptTries:      defaultAptTries,
+		aptRetryDelay: defaultAptRetryDelay,
 	}
 }
 
@@ -62,10 +67,11 @@ func (m *Manager) SetReporter(fn func(context.Context, client.AgentSetupObserved
 	m.reporter = fn
 }
 
-func (m *Manager) SetWaitsForTest(pollDelay time.Duration, nvidiaTries, aptLockTries int) {
+func (m *Manager) SetWaitsForTest(pollDelay time.Duration, nvidiaTries, aptTries int) {
 	m.pollDelay = pollDelay
 	m.nvidiaTries = nvidiaTries
-	m.aptLockTries = aptLockTries
+	m.aptTries = aptTries
+	m.aptRetryDelay = pollDelay
 }
 
 func (m *Manager) emit(ctx context.Context, obs client.AgentSetupObserved) {
@@ -75,6 +81,8 @@ func (m *Manager) emit(ctx context.Context, obs client.AgentSetupObserved) {
 }
 
 func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
+	m.ensureAptLockConfig(ctx)
+
 	steps := m.steps()
 	total := len(steps)
 	for i, s := range steps {
@@ -105,10 +113,10 @@ func (m *Manager) steps() []step {
 				return m.commandExists(ctx, "gpg") && m.commandExists(ctx, "unzip") && m.commandExists(ctx, "lspci")
 			},
 			run: func(ctx context.Context) error {
-				if _, err := m.sh(ctx, aptTimeout, "DEBIAN_FRONTEND=noninteractive apt-get update"); err != nil {
+				if _, err := m.apt(ctx, "update"); err != nil {
 					return err
 				}
-				_, err := m.sh(ctx, aptTimeout, "DEBIAN_FRONTEND=noninteractive apt-get install -y gnupg unzip pciutils ca-certificates curl")
+				_, err := m.apt(ctx, "install -y gnupg unzip pciutils ca-certificates curl")
 				return err
 			},
 		},
@@ -149,18 +157,16 @@ func (m *Manager) steps() []step {
 
 func (m *Manager) configureNvidia(ctx context.Context) error {
 	if !m.commandExists(ctx, "nvidia-ctk") {
-		m.waitForAptLock(ctx)
 		if _, err := m.sh(ctx, aptTimeout, "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"); err != nil {
 			return err
 		}
 		if _, err := m.sh(ctx, aptTimeout, "curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"); err != nil {
 			return err
 		}
-		m.waitForAptLock(ctx)
-		if _, err := m.sh(ctx, aptTimeout, "DEBIAN_FRONTEND=noninteractive apt-get update"); err != nil {
+		if _, err := m.apt(ctx, "update"); err != nil {
 			return err
 		}
-		if _, err := m.sh(ctx, aptTimeout, "DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit"); err != nil {
+		if _, err := m.apt(ctx, "install -y nvidia-container-toolkit"); err != nil {
 			return err
 		}
 	}
@@ -190,11 +196,13 @@ func (m *Manager) configureNvidia(ctx context.Context) error {
 }
 
 func (m *Manager) installStorage(ctx context.Context) error {
-	if _, err := m.sh(ctx, aptTimeout, "DEBIAN_FRONTEND=noninteractive apt-get update"); err != nil {
+	if _, err := m.apt(ctx, "update"); err != nil {
 		return err
 	}
-	if _, err := m.sh(ctx, aptTimeout, "DEBIAN_FRONTEND=noninteractive apt-get install -y fuse3 || DEBIAN_FRONTEND=noninteractive apt-get install -y fuse"); err != nil {
-		return err
+	if _, err := m.apt(ctx, "install -y fuse3"); err != nil {
+		if _, err := m.apt(ctx, "install -y fuse"); err != nil {
+			return err
+		}
 	}
 	if _, err := m.sh(ctx, cmdTimeout, "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' >> /etc/fuse.conf"); err != nil {
 		return err
@@ -203,17 +211,34 @@ func (m *Manager) installStorage(ctx context.Context) error {
 	return err
 }
 
-func (m *Manager) waitForAptLock(ctx context.Context) {
-	for i := 0; i < m.aptLockTries; i++ {
-		if _, err := m.exec.Run(ctx, cmdTimeout, "sh", "-c", "fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1"); err != nil {
-			return
+func (m *Manager) apt(ctx context.Context, args string) (string, error) {
+	script := fmt.Sprintf("DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=%d %s", aptLockTimeoutS, args)
+
+	var out string
+	var err error
+	for i := 0; i < m.aptTries; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return out, ctx.Err()
+			case <-time.After(m.aptRetryDelay):
+			}
 		}
-		m.log.Debug("waiting for apt lock")
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(m.pollDelay):
+		if out, err = m.sh(ctx, aptTimeout, script); err == nil {
+			return out, nil
 		}
+		m.log.Warn("apt-get failed", "args", args, "attempt", i+1, "of", m.aptTries, "err", err)
+	}
+	return out, err
+}
+
+func (m *Manager) ensureAptLockConfig(ctx context.Context) {
+	if _, err := m.exec.Run(ctx, cmdTimeout, "sh", "-c", "test -f "+aptConfPath); err == nil {
+		return
+	}
+	script := fmt.Sprintf("printf 'DPkg::Lock::Timeout \"%d\";\\n' > %s", aptLockTimeoutS, aptConfPath)
+	if _, err := m.exec.Run(ctx, cmdTimeout, "sh", "-c", script); err != nil {
+		m.log.Warn("apt lock config write failed", "path", aptConfPath, "err", err)
 	}
 }
 

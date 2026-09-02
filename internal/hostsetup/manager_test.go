@@ -20,15 +20,17 @@ func testLogger() *slog.Logger {
 type fakeExec struct {
 	calls *[]string
 
-	present       map[string]bool
-	gpu           bool
-	dockerUp      bool
-	rcloneOK      bool
-	fuseOK        bool
-	aptLockFree   bool
-	nvidiaRuntime []bool
-	nvidiaProbes  int
-	failContains  string
+	present        map[string]bool
+	gpu            bool
+	dockerUp       bool
+	rcloneOK       bool
+	fuseOK         bool
+	aptConfPresent bool
+	nvidiaRuntime  []bool
+	nvidiaProbes   int
+	failContains   string
+	failTimes      int
+	failSeen       int
 }
 
 func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
@@ -62,11 +64,11 @@ func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...
 		}
 		return "", errors.New("not configured")
 
-	case strings.Contains(script, "fuser"):
-		if f.aptLockFree {
-			return "", errors.New("no lock holder")
+	case strings.HasPrefix(script, "test -f /etc/apt/apt.conf.d/"):
+		if f.aptConfPresent {
+			return "", nil
 		}
-		return "", nil
+		return "", errors.New("no such file")
 
 	case name == "docker" && len(args) >= 2 && args[0] == "info" && args[1] == "--format":
 		idx := f.nvidiaProbes
@@ -97,7 +99,10 @@ func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...
 	}
 
 	if f.failContains != "" && script != "" && strings.Contains(script, f.failContains) {
-		return "partial stdout before failure", errors.New("exit status 1 (stderr: boom)")
+		if f.failTimes == 0 || f.failSeen < f.failTimes {
+			f.failSeen++
+			return "partial stdout before failure", errors.New("exit status 1 (stderr: boom)")
+		}
 	}
 	return "", nil
 }
@@ -113,20 +118,21 @@ func joined(calls []string) string { return strings.Join(calls, " | ") }
 func TestReconcileReadyHostIsNoop(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
-		calls:         &calls,
-		present:       map[string]bool{"gpg": true, "unzip": true, "lspci": true, "nvidia-ctk": true},
-		gpu:           true,
-		dockerUp:      true,
-		rcloneOK:      true,
-		fuseOK:        true,
-		nvidiaRuntime: []bool{true},
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "unzip": true, "lspci": true, "nvidia-ctk": true},
+		gpu:            true,
+		dockerUp:       true,
+		rcloneOK:       true,
+		fuseOK:         true,
+		aptConfPresent: true,
+		nvidiaRuntime:  []bool{true},
 	}
 	obs := newManager(fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("ready host → ready, got %s", obs.ObservedState)
 	}
 	for _, c := range calls {
-		if strings.Contains(c, "apt-get install") || strings.Contains(c, "get.docker.com") ||
+		if strings.Contains(c, "apt-get -o DPkg::Lock::Timeout") || strings.Contains(c, "get.docker.com") ||
 			strings.Contains(c, "nvidia-ctk runtime configure") || strings.Contains(c, "rclone-current") {
 			t.Errorf("ready host must not mutate, got call: %s", c)
 		}
@@ -142,7 +148,6 @@ func TestReconcileFreshHostRunsAllStepsInOrder(t *testing.T) {
 		dockerUp:      false,
 		rcloneOK:      false,
 		fuseOK:        false,
-		aptLockFree:   true,
 		nvidiaRuntime: []bool{true},
 	}
 	obs := newManager(fe).Reconcile(context.Background())
@@ -164,13 +169,12 @@ func TestReconcileFreshHostRunsAllStepsInOrder(t *testing.T) {
 func TestReconcileSkipsNvidiaWhenNoGPU(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
-		calls:       &calls,
-		present:     map[string]bool{"gpg": true, "unzip": true, "lspci": true},
-		gpu:         false,
-		dockerUp:    true,
-		rcloneOK:    true,
-		fuseOK:      true,
-		aptLockFree: true,
+		calls:    &calls,
+		present:  map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		gpu:      false,
+		dockerUp: true,
+		rcloneOK: true,
+		fuseOK:   true,
 	}
 	obs := newManager(fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
@@ -191,7 +195,6 @@ func TestReconcileDockerHardResetAndRuntimeWait(t *testing.T) {
 		dockerUp:      true,
 		rcloneOK:      true,
 		fuseOK:        true,
-		aptLockFree:   true,
 		nvidiaRuntime: []bool{false, false, true},
 	}
 	obs := newManager(fe).Reconcile(context.Background())
@@ -211,7 +214,6 @@ func TestReconcileNvidiaRuntimeNeverAppearsIsError(t *testing.T) {
 		dockerUp:      true,
 		rcloneOK:      true,
 		fuseOK:        true,
-		aptLockFree:   true,
 		nvidiaRuntime: []bool{false},
 	}
 	obs := newManager(fe).Reconcile(context.Background())
@@ -229,7 +231,7 @@ func TestReconcileStopsOnFirstErrorAndReportsBundle(t *testing.T) {
 		calls:        &calls,
 		present:      map[string]bool{"lspci": true},
 		dockerUp:     true,
-		failContains: "apt-get install -y gnupg",
+		failContains: "install -y gnupg",
 	}
 	obs := newManager(fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupError {
@@ -246,6 +248,106 @@ func TestReconcileStopsOnFirstErrorAndReportsBundle(t *testing.T) {
 	}
 }
 
+func TestAptCallsAlwaysWaitForDpkgLock(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:         &calls,
+		present:       map[string]bool{},
+		gpu:           true,
+		dockerUp:      false,
+		rcloneOK:      false,
+		fuseOK:        false,
+		nvidiaRuntime: []bool{true},
+	}
+	newManager(fe).Reconcile(context.Background())
+
+	seen := 0
+	for _, c := range calls {
+		if !strings.Contains(c, "apt-get") {
+			continue
+		}
+		seen++
+		if !strings.Contains(c, "-o DPkg::Lock::Timeout=300") {
+			t.Errorf("apt-get without lock wait (unattended-upgrades would fail it instantly): %s", c)
+		}
+	}
+	if seen == 0 {
+		t.Fatal("expected apt-get calls on a fresh host")
+	}
+}
+
+func TestAptRetriesTransientFailure(t *testing.T) {
+	fe := &fakeExec{
+		present:       map[string]bool{},
+		gpu:           true,
+		dockerUp:      false,
+		rcloneOK:      false,
+		fuseOK:        false,
+		nvidiaRuntime: []bool{true},
+		failContains:  "install -y gnupg",
+		failTimes:     2,
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("apt must survive %d transient failures, got %s (err %v)", fe.failTimes, obs.ObservedState, obs.LastError)
+	}
+}
+
+func TestAptGivesUpAfterAllTries(t *testing.T) {
+	fe := &fakeExec{
+		present:      map[string]bool{},
+		dockerUp:     true,
+		failContains: "install -y gnupg",
+		failTimes:    3,
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupError {
+		t.Fatalf("failures beyond the retry budget → error, got %s", obs.ObservedState)
+	}
+}
+
+func TestReconcileWritesAptLockConfigOnceWhenMissing(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		gpu:            false,
+		dockerUp:       true,
+		rcloneOK:       true,
+		fuseOK:         true,
+		aptConfPresent: false,
+	}
+	newManager(fe).Reconcile(context.Background())
+
+	writes := 0
+	for _, c := range calls {
+		if strings.Contains(c, "printf") && strings.Contains(c, "DPkg::Lock::Timeout") {
+			writes++
+		}
+	}
+	if writes != 1 {
+		t.Errorf("missing config must be written exactly once, got %d writes: %s", writes, joined(calls))
+	}
+}
+
+func TestReconcileKeepsExistingAptLockConfig(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		gpu:            false,
+		dockerUp:       true,
+		rcloneOK:       true,
+		fuseOK:         true,
+		aptConfPresent: true,
+	}
+	newManager(fe).Reconcile(context.Background())
+
+	if strings.Contains(joined(calls), "printf") {
+		t.Errorf("existing config must not be rewritten (cloud-init owns it), calls: %s", joined(calls))
+	}
+}
+
 func TestReconcileEmitsPhasesInOrder(t *testing.T) {
 	var emits []string
 	fe := &fakeExec{
@@ -254,7 +356,6 @@ func TestReconcileEmitsPhasesInOrder(t *testing.T) {
 		dockerUp:      false,
 		rcloneOK:      false,
 		fuseOK:        false,
-		aptLockFree:   true,
 		nvidiaRuntime: []bool{true},
 	}
 	m := newManager(fe)
@@ -290,7 +391,6 @@ func TestReconcileProgressMonotonic(t *testing.T) {
 		dockerUp:      false,
 		rcloneOK:      false,
 		fuseOK:        false,
-		aptLockFree:   true,
 		nvidiaRuntime: []bool{true},
 	}
 	m := newManager(fe)
