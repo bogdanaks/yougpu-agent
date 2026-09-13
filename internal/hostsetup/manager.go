@@ -21,6 +21,7 @@ const (
 	cmdTimeout      = 30 * time.Second
 	downloadTimeout = 5 * time.Minute
 	agentLogPath    = "/var/log/yougpu-agent.log"
+	unzipViaPython  = `python3 -c "import zipfile; zipfile.ZipFile('/tmp/rclone.zip').extractall('/tmp')"`
 	maxLastError    = 1024
 	maxLogTail      = 4096
 
@@ -110,13 +111,13 @@ func (m *Manager) steps() []step {
 		{
 			phase: client.SetupInstallingBase,
 			skip: func(ctx context.Context) bool {
-				return m.commandExists(ctx, "gpg") && m.commandExists(ctx, "unzip") && m.commandExists(ctx, "lspci")
+				return m.commandExists(ctx, "gpg") && m.commandExists(ctx, "lspci") && m.commandExists(ctx, "curl")
 			},
 			run: func(ctx context.Context) error {
 				if _, err := m.apt(ctx, "update"); err != nil {
 					return err
 				}
-				_, err := m.apt(ctx, "install -y gnupg unzip pciutils ca-certificates curl")
+				_, err := m.apt(ctx, "install -y gnupg pciutils ca-certificates curl")
 				return err
 			},
 		},
@@ -196,19 +197,52 @@ func (m *Manager) configureNvidia(ctx context.Context) error {
 }
 
 func (m *Manager) installStorage(ctx context.Context) error {
-	if _, err := m.apt(ctx, "update"); err != nil {
-		return err
-	}
-	if _, err := m.apt(ctx, "install -y fuse3"); err != nil {
-		if _, err := m.apt(ctx, "install -y fuse"); err != nil {
+	if !m.fuseAvailable(ctx) {
+		if _, err := m.apt(ctx, "update"); err != nil {
 			return err
+		}
+		if _, err := m.apt(ctx, "install -y fuse3"); err != nil {
+			if _, err := m.apt(ctx, "install -y fuse"); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err := m.sh(ctx, cmdTimeout, "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' >> /etc/fuse.conf"); err != nil {
 		return err
 	}
-	_, err := m.sh(ctx, downloadTimeout, "curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip && unzip -q -o /tmp/rclone.zip -d /tmp/ && cp /tmp/rclone-*-linux-amd64/rclone /usr/bin/ && chown root:root /usr/bin/rclone && chmod 755 /usr/bin/rclone && rm -rf /tmp/rclone.zip /tmp/rclone-*-linux-amd64 && mkdir -p /root/.config/rclone")
+	if !m.rcloneOK(ctx) {
+		if _, err := m.sh(ctx, downloadTimeout, "curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip"); err != nil {
+			return err
+		}
+		if err := m.unzipRclone(ctx); err != nil {
+			return err
+		}
+		if _, err := m.sh(ctx, cmdTimeout, "cp /tmp/rclone-*-linux-amd64/rclone /usr/bin/ && chown root:root /usr/bin/rclone && chmod 755 /usr/bin/rclone && rm -rf /tmp/rclone.zip /tmp/rclone-*-linux-amd64"); err != nil {
+			return err
+		}
+	}
+	_, err := m.sh(ctx, cmdTimeout, "mkdir -p /root/.config/rclone")
 	return err
+}
+
+func (m *Manager) unzipRclone(ctx context.Context) error {
+	if _, err := m.sh(ctx, cmdTimeout, unzipViaPython); err == nil {
+		return nil
+	}
+	if !m.commandExists(ctx, "unzip") {
+		if _, err := m.apt(ctx, "update"); err != nil {
+			return err
+		}
+		if _, err := m.apt(ctx, "install -y unzip"); err != nil {
+			return err
+		}
+	}
+	_, err := m.sh(ctx, cmdTimeout, "unzip -q -o /tmp/rclone.zip -d /tmp/")
+	return err
+}
+
+func (m *Manager) fuseAvailable(ctx context.Context) bool {
+	return m.commandExists(ctx, "fusermount3") || m.commandExists(ctx, "fusermount")
 }
 
 func (m *Manager) apt(ctx context.Context, args string) (string, error) {

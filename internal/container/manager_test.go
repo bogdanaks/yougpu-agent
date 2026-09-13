@@ -130,16 +130,61 @@ type fakePuller struct {
 	pulled   []string
 	progress []PullProgress
 	err      error
+	order    *[]string
 }
 
 func (p *fakePuller) Pull(_ context.Context, image string, onProgress func(PullProgress)) error {
 	p.pulled = append(p.pulled, image)
+	if p.order != nil {
+		*p.order = append(*p.order, "pull")
+	}
 	for _, pp := range p.progress {
 		if onProgress != nil {
 			onProgress(pp)
 		}
 	}
 	return p.err
+}
+
+func TestReconcileCallsGateBetweenPullAndRun(t *testing.T) {
+	spec := sampleSpec()
+	spec.Volumes = nil
+	var order []string
+	puller := &fakePuller{order: &order}
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, puller, testLogger())
+
+	_ = m.Reconcile(context.Background(), spec, func() { order = append(order, "gate") })
+
+	pull, gate, run := -1, -1, -1
+	for i, c := range order {
+		switch {
+		case c == "pull":
+			pull = i
+		case c == "gate":
+			gate = i
+		case strings.Contains(c, "docker run -d"):
+			run = i
+		}
+	}
+	if pull < 0 || gate < 0 || run < 0 {
+		t.Fatalf("expected pull, gate and run, got %v", order)
+	}
+	if !(pull < gate && gate < run) {
+		t.Errorf("gate must sit between pull and run, got %v", order)
+	}
+}
+
+func TestReconcileSkipsGateWhenNothingToApply(t *testing.T) {
+	spec := sampleSpec()
+	hash := SpecHash(spec)
+	gated := false
+	m := NewManager(scriptExec{t: t, inspect: "true|" + hash}, &fakePuller{}, testLogger())
+
+	_ = m.Reconcile(context.Background(), spec, func() { gated = true })
+
+	if gated {
+		t.Error("gate must not be called when the running container already matches the spec")
+	}
 }
 
 func TestReconcileNoopWhenRunningMatches(t *testing.T) {
@@ -149,7 +194,7 @@ func TestReconcileNoopWhenRunningMatches(t *testing.T) {
 	puller := &fakePuller{}
 	m := NewManager(scriptExec{t: t, inspect: "true|" + hash, runCalls: &calls}, puller, testLogger())
 
-	obs := m.Reconcile(context.Background(), spec)
+	obs := m.Reconcile(context.Background(), spec, nil)
 	if obs.ObservedState != client.ContainerRunning {
 		t.Fatalf("want running, got %s", obs.ObservedState)
 	}
@@ -170,7 +215,7 @@ func TestReconcileAppliesWhenAbsent(t *testing.T) {
 	puller := &fakePuller{}
 	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("Error: No such object: app_container"), runCalls: &calls}, puller, testLogger())
 
-	_ = m.Reconcile(context.Background(), spec)
+	_ = m.Reconcile(context.Background(), spec, nil)
 	if len(puller.pulled) != 1 || puller.pulled[0] != "pytorch/pytorch:latest" {
 		t.Fatalf("expected pull of image, pulled: %v", puller.pulled)
 	}
@@ -200,7 +245,7 @@ func TestReconcileEmitsPhases(t *testing.T) {
 		}
 	})
 
-	_ = m.Reconcile(context.Background(), spec)
+	_ = m.Reconcile(context.Background(), spec, nil)
 	joined := strings.Join(phases, ",")
 	if !strings.HasPrefix(joined, "pulling,") {
 		t.Fatalf("first phase must be pulling, got: %s", joined)
@@ -219,7 +264,7 @@ func TestReconcileRemovesOrphanWhenNoSpec(t *testing.T) {
 	var calls []string
 	m := NewManager(scriptExec{t: t, inspect: "true|", runCalls: &calls}, nil, testLogger())
 
-	obs := m.Reconcile(context.Background(), nil)
+	obs := m.Reconcile(context.Background(), nil, nil)
 	if obs.ObservedState != client.ContainerAbsent {
 		t.Fatalf("want absent after removing orphan, got %s", obs.ObservedState)
 	}

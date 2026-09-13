@@ -90,7 +90,7 @@ func Decide(hasSpec bool, desiredHash string, obs Observed) Action {
 	return ActionApply
 }
 
-func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec) client.AgentContainerObserved {
+func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved {
 	hasSpec := spec != nil
 	desiredHash := SpecHash(spec)
 
@@ -115,7 +115,7 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec
 		return client.AgentContainerObserved{ObservedState: client.ContainerAbsent}
 	case ActionApply:
 		m.log.Info("applying container spec", "name", m.name, "image", spec.Image, "hash", desiredHash)
-		if err := m.apply(ctx, spec, desiredHash); err != nil {
+		if err := m.apply(ctx, spec, desiredHash, beforeStart); err != nil {
 			m.log.Error("container apply failed", "err", err)
 			return m.errorReport(desiredHash, err)
 		}
@@ -175,7 +175,7 @@ func (m *Manager) remove(ctx context.Context) error {
 	return err
 }
 
-func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, hash string) error {
+func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, hash string, beforeStart func()) error {
 	for _, v := range spec.Volumes {
 		if v.Host == "" {
 			continue
@@ -208,6 +208,10 @@ func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, ha
 	}
 	if err := m.puller.Pull(pullCtx, spec.Image, onProgress); err != nil {
 		return fmt.Errorf("pull %s: %w", spec.Image, err)
+	}
+
+	if beforeStart != nil {
+		beforeStart()
 	}
 
 	if err := m.remove(ctx); err != nil {

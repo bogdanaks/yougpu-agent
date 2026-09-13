@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
@@ -14,21 +16,47 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+type recorder struct {
+	mu    sync.Mutex
+	items []string
+}
+
+func (r *recorder) add(s string) {
+	r.mu.Lock()
+	r.items = append(r.items, s)
+	r.mu.Unlock()
+}
+
+func (r *recorder) list() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.items...)
+}
+
+func (r *recorder) index(s string) int {
+	for i, v := range r.list() {
+		if v == s {
+			return i
+		}
+	}
+	return -1
+}
+
 type fakeHostSetup struct {
-	rec    *[]string
+	rec    *recorder
 	obs    client.AgentSetupObserved
 	called bool
 }
 
 func (f *fakeHostSetup) Reconcile(_ context.Context) client.AgentSetupObserved {
 	f.called = true
-	*f.rec = append(*f.rec, "hostsetup")
+	f.rec.add("hostsetup")
 	return f.obs
 }
 func (f *fakeHostSetup) SetReporter(func(context.Context, client.AgentSetupObserved)) {}
 
 type fakeDisk struct {
-	rec        *[]string
+	rec        *recorder
 	listCalled bool
 }
 
@@ -37,50 +65,62 @@ func (f *fakeDisk) Unmount(context.Context, string) error             { return n
 func (f *fakeDisk) IsActive(context.Context, string) (bool, error)    { return false, nil }
 func (f *fakeDisk) ListUnits() ([]string, error) {
 	if !f.listCalled {
-		*f.rec = append(*f.rec, "disk")
+		f.rec.add("disk")
 	}
 	f.listCalled = true
 	return nil, nil
 }
 
 type fakeContainer struct {
-	rec    *[]string
+	rec    *recorder
 	called bool
 }
 
-func (f *fakeContainer) Reconcile(context.Context, *client.AgentContainerSpec) client.AgentContainerObserved {
+func (f *fakeContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved {
 	f.called = true
-	*f.rec = append(*f.rec, "container")
+	f.rec.add("container")
+	if beforeStart != nil {
+		beforeStart()
+	}
 	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
 }
 func (f *fakeContainer) SetReporter(func(context.Context, client.AgentContainerObserved)) {}
 
 type fakeFirewall struct {
-	rec    *[]string
+	rec    *recorder
 	called bool
 }
 
 func (f *fakeFirewall) Reconcile(context.Context, *client.AgentFirewallSpec) client.AgentFirewallObserved {
 	f.called = true
-	*f.rec = append(*f.rec, "firewall")
+	f.rec.add("firewall")
 	return client.AgentFirewallObserved{ObservedState: client.FirewallApplied}
 }
 
 type fakeClient struct {
+	mu       sync.Mutex
 	statuses []*client.AgentStatus
 }
 
 func (f *fakeClient) PostStatus(_ context.Context, s *client.AgentStatus) error {
+	f.mu.Lock()
 	f.statuses = append(f.statuses, s)
+	f.mu.Unlock()
 	return nil
 }
 func (f *fakeClient) StreamSpec(context.Context, chan<- *client.AgentSpec) error { return nil }
 func (f *fakeClient) Heartbeat(context.Context) error                            { return nil }
 
+func (f *fakeClient) posted() []*client.AgentStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*client.AgentStatus(nil), f.statuses...)
+}
+
 type fakeLifecycle struct{}
 
-func (fakeLifecycle) CurrentState() string      { return lifecycle.StateAlive }
-func (fakeLifecycle) SetState(string) error     { return nil }
+func (fakeLifecycle) CurrentState() string           { return lifecycle.StateAlive }
+func (fakeLifecycle) SetState(string) error          { return nil }
 func (fakeLifecycle) Poweroff(context.Context) error { return nil }
 func (fakeLifecycle) HandleTermination(context.Context, lifecycle.Disker) (string, error) {
 	return lifecycle.StateSynced, nil
@@ -92,7 +132,7 @@ func (fakeCreds) EnsureFresh(context.Context) error  { return nil }
 func (fakeCreds) ForceRefresh(context.Context) error { return nil }
 func (fakeCreds) Run(context.Context)                {}
 
-func newTestAgent(rec *[]string, setup client.AgentSetupObserved) (*Agent, *fakeClient, *fakeDisk, *fakeContainer, *fakeFirewall, *fakeHostSetup) {
+func newTestAgent(rec *recorder, setup client.AgentSetupObserved) (*Agent, *fakeClient, *fakeDisk, *fakeContainer, *fakeFirewall, *fakeHostSetup) {
 	cl := &fakeClient{}
 	disk := &fakeDisk{rec: rec}
 	cont := &fakeContainer{rec: rec}
@@ -120,8 +160,8 @@ func specWithWork() *client.AgentSpec {
 }
 
 func TestHandleSpecGatesDownstreamUntilSetupReady(t *testing.T) {
-	var order []string
-	a, cl, disk, cont, fw, hs := newTestAgent(&order, client.AgentSetupObserved{ObservedState: client.SetupInstallingDocker})
+	rec := &recorder{}
+	a, cl, disk, cont, fw, hs := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupInstallingDocker})
 	spec := specWithWork()
 	a.lastSpec = spec
 
@@ -136,17 +176,18 @@ func TestHandleSpecGatesDownstreamUntilSetupReady(t *testing.T) {
 		t.Errorf("downstream must NOT run while setup != ready (disk=%v container=%v firewall=%v)",
 			disk.listCalled, cont.called, fw.called)
 	}
-	if len(cl.statuses) != 1 || cl.statuses[0].Setup == nil {
-		t.Fatalf("must post one status carrying setup block, got %d", len(cl.statuses))
+	posted := cl.posted()
+	if len(posted) != 1 || posted[0].Setup == nil {
+		t.Fatalf("must post one status carrying setup block, got %d", len(posted))
 	}
-	if cl.statuses[0].Setup.ObservedState != client.SetupInstallingDocker {
-		t.Errorf("posted setup state = %s", cl.statuses[0].Setup.ObservedState)
+	if posted[0].Setup.ObservedState != client.SetupInstallingDocker {
+		t.Errorf("posted setup state = %s", posted[0].Setup.ObservedState)
 	}
 }
 
 func TestHandleSpecRunsDownstreamWhenSetupReady(t *testing.T) {
-	var order []string
-	a, cl, disk, cont, fw, _ := newTestAgent(&order, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	rec := &recorder{}
+	a, cl, disk, cont, fw, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
 	spec := specWithWork()
 	a.lastSpec = spec
 
@@ -158,14 +199,15 @@ func TestHandleSpecRunsDownstreamWhenSetupReady(t *testing.T) {
 		t.Errorf("ready host must run downstream (disk=%v container=%v firewall=%v)",
 			disk.listCalled, cont.called, fw.called)
 	}
-	if len(cl.statuses) == 0 || cl.statuses[len(cl.statuses)-1].Setup == nil {
+	posted := cl.posted()
+	if len(posted) == 0 || posted[len(posted)-1].Setup == nil {
 		t.Error("final status must still carry the setup block")
 	}
 }
 
 func TestHandleSpecOrderHostSetupFirst(t *testing.T) {
-	var order []string
-	a, _, _, _, _, _ := newTestAgent(&order, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	rec := &recorder{}
+	a, _, _, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
 	spec := specWithWork()
 	a.lastSpec = spec
 
@@ -173,19 +215,113 @@ func TestHandleSpecOrderHostSetupFirst(t *testing.T) {
 		t.Fatalf("handleSpec: %v", err)
 	}
 
-	idx := func(name string) int {
-		for i, v := range order {
-			if v == name {
-				return i
-			}
-		}
-		return -1
-	}
-	hs, dk, ct, fw := idx("hostsetup"), idx("disk"), idx("container"), idx("firewall")
+	hs, dk, ct, fw := rec.index("hostsetup"), rec.index("disk"), rec.index("container"), rec.index("firewall")
 	if hs < 0 || dk < 0 || ct < 0 || fw < 0 {
-		t.Fatalf("all stages must run, order: %v", order)
+		t.Fatalf("all stages must run, order: %v", rec.list())
 	}
 	if !(hs < dk && dk < ct && ct < fw) {
-		t.Errorf("order must be hostsetup→disk→container→firewall, got %v", order)
+		t.Errorf("order must be hostsetup→disk→container→firewall, got %v", rec.list())
+	}
+}
+
+type gatedContainer struct {
+	rec      *recorder
+	pullSeen chan struct{}
+}
+
+func (g *gatedContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved {
+	g.rec.add("pull")
+	close(g.pullSeen)
+	if beforeStart != nil {
+		beforeStart()
+	}
+	g.rec.add("run")
+	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
+}
+func (g *gatedContainer) SetReporter(func(context.Context, client.AgentContainerObserved)) {}
+
+type fakeContent struct {
+	rec      *recorder
+	pullSeen chan struct{}
+	obs      client.AgentContentObserved
+}
+
+func (f *fakeContent) Reconcile(context.Context, *client.AgentContentSpec, *client.AgentContainerSpec) client.AgentContentObserved {
+	select {
+	case <-f.pullSeen:
+		f.rec.add("content")
+	case <-time.After(2 * time.Second):
+		f.rec.add("content_without_pull")
+	}
+	return f.obs
+}
+func (f *fakeContent) SetReporter(func(context.Context, client.AgentContentObserved)) {}
+
+func TestHandleSpecPullsWhileContentDownloads(t *testing.T) {
+	rec := &recorder{}
+	pullSeen := make(chan struct{})
+	cl := &fakeClient{}
+	a := New(Config{
+		Client:    cl,
+		Disk:      &fakeDisk{rec: rec},
+		Container: &gatedContainer{rec: rec, pullSeen: pullSeen},
+		Firewall:  &fakeFirewall{rec: rec},
+		HostSetup: &fakeHostSetup{rec: rec, obs: client.AgentSetupObserved{ObservedState: client.SetupReady}},
+		Content:   &fakeContent{rec: rec, pullSeen: pullSeen, obs: client.AgentContentObserved{ObservedState: client.ContentReady}},
+		Lifecycle: fakeLifecycle{},
+		Creds:     fakeCreds{},
+		Logger:    testLogger(),
+	})
+	spec := specWithWork()
+	spec.Content = &client.AgentContentSpec{Models: []client.ContentModel{{URL: "http://x/m.bin", Name: "m.bin"}}}
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+
+	pull, content, run := rec.index("pull"), rec.index("content"), rec.index("run")
+	if pull < 0 || content < 0 || run < 0 {
+		t.Fatalf("expected pull/content/run, got %v", rec.list())
+	}
+	if pull > content {
+		t.Errorf("pull must start before content finishes, got %v", rec.list())
+	}
+	if content > run {
+		t.Errorf("container must start only after content is done, got %v", rec.list())
+	}
+
+	posted := cl.posted()
+	if len(posted) == 0 || posted[len(posted)-1].Content == nil {
+		t.Fatalf("final status must carry the content block, got %d statuses", len(posted))
+	}
+}
+
+func TestHandleSpecWaitsForContentWhenContainerUnchanged(t *testing.T) {
+	rec := &recorder{}
+	pullSeen := make(chan struct{})
+	close(pullSeen)
+	cl := &fakeClient{}
+	a := New(Config{
+		Client:    cl,
+		Disk:      &fakeDisk{rec: rec},
+		Firewall:  &fakeFirewall{rec: rec},
+		HostSetup: &fakeHostSetup{rec: rec, obs: client.AgentSetupObserved{ObservedState: client.SetupReady}},
+		Content:   &fakeContent{rec: rec, pullSeen: pullSeen, obs: client.AgentContentObserved{ObservedState: client.ContentReady}},
+		Lifecycle: fakeLifecycle{},
+		Creds:     fakeCreds{},
+		Logger:    testLogger(),
+	})
+	spec := specWithWork()
+	spec.Content = &client.AgentContentSpec{Models: []client.ContentModel{{URL: "http://x/m.bin", Name: "m.bin"}}}
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+
+	posted := cl.posted()
+	if len(posted) == 0 || posted[len(posted)-1].Content == nil {
+		t.Fatalf("content result must be reported even without a container, got %d statuses", len(posted))
 	}
 }

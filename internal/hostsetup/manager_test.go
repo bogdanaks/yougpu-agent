@@ -119,7 +119,7 @@ func TestReconcileReadyHostIsNoop(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
 		calls:          &calls,
-		present:        map[string]bool{"gpg": true, "unzip": true, "lspci": true, "nvidia-ctk": true},
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "nvidia-ctk": true},
 		gpu:            true,
 		dockerUp:       true,
 		rcloneOK:       true,
@@ -170,7 +170,7 @@ func TestReconcileSkipsNvidiaWhenNoGPU(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
 		calls:    &calls,
-		present:  map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		present:  map[string]bool{"gpg": true, "curl": true, "lspci": true},
 		gpu:      false,
 		dockerUp: true,
 		rcloneOK: true,
@@ -190,7 +190,7 @@ func TestReconcileDockerHardResetAndRuntimeWait(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
 		calls:         &calls,
-		present:       map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		present:       map[string]bool{"gpg": true, "curl": true, "lspci": true},
 		gpu:           true,
 		dockerUp:      true,
 		rcloneOK:      true,
@@ -209,7 +209,7 @@ func TestReconcileDockerHardResetAndRuntimeWait(t *testing.T) {
 
 func TestReconcileNvidiaRuntimeNeverAppearsIsError(t *testing.T) {
 	fe := &fakeExec{
-		present:       map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		present:       map[string]bool{"gpg": true, "curl": true, "lspci": true},
 		gpu:           true,
 		dockerUp:      true,
 		rcloneOK:      true,
@@ -306,11 +306,80 @@ func TestAptGivesUpAfterAllTries(t *testing.T) {
 	}
 }
 
+func TestReconcileStockImageNeedsNoApt(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "fusermount3": true, "nvidia-ctk": true},
+		gpu:            true,
+		dockerUp:       true,
+		rcloneOK:       false,
+		fuseOK:         false,
+		aptConfPresent: true,
+		nvidiaRuntime:  []bool{true},
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("stock image → ready, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	j := joined(calls)
+	if strings.Contains(j, "apt-get") {
+		t.Errorf("stock image must not touch apt at all, calls: %s", j)
+	}
+	if !strings.Contains(j, "rclone-current") || !strings.Contains(j, "zipfile") {
+		t.Errorf("rclone must be fetched and unpacked without unzip, calls: %s", j)
+	}
+}
+
+func TestReconcileFallsBackToUnzipWithoutPython(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "fusermount3": true, "nvidia-ctk": true},
+		gpu:            true,
+		dockerUp:       true,
+		rcloneOK:       false,
+		fuseOK:         false,
+		aptConfPresent: true,
+		nvidiaRuntime:  []bool{true},
+		failContains:   "zipfile",
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("missing python3 → still ready via unzip, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	j := joined(calls)
+	if !strings.Contains(j, "install -y unzip") || !strings.Contains(j, "unzip -q -o /tmp/rclone.zip") {
+		t.Errorf("must install and use unzip when python3 is unavailable, calls: %s", j)
+	}
+}
+
+func TestReconcileInstallsFuseOnlyWhenMissing(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "nvidia-ctk": true},
+		gpu:            true,
+		dockerUp:       true,
+		rcloneOK:       true,
+		fuseOK:         false,
+		aptConfPresent: true,
+		nvidiaRuntime:  []bool{true},
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("expected ready, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	if !strings.Contains(joined(calls), "install -y fuse3") {
+		t.Errorf("absent fusermount must trigger fuse3 install, calls: %s", joined(calls))
+	}
+}
+
 func TestReconcileWritesAptLockConfigOnceWhenMissing(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
 		calls:          &calls,
-		present:        map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true},
 		gpu:            false,
 		dockerUp:       true,
 		rcloneOK:       true,
@@ -334,7 +403,7 @@ func TestReconcileKeepsExistingAptLockConfig(t *testing.T) {
 	var calls []string
 	fe := &fakeExec{
 		calls:          &calls,
-		present:        map[string]bool{"gpg": true, "unzip": true, "lspci": true},
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true},
 		gpu:            false,
 		dockerUp:       true,
 		rcloneOK:       true,

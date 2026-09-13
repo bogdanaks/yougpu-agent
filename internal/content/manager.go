@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
@@ -22,12 +24,16 @@ const (
 	WorkspaceContainerPath = "/workspace"
 	dirPerm                = 0o777
 	reportInterval         = 2 * time.Second
+	rangeParts             = 4
+	rangeMinSize           = 64 << 20
+	rangeAttempts          = 3
 )
 
 type Manager struct {
 	httpClient *http.Client
 	logger     *slog.Logger
 	reporter   func(context.Context, client.AgentContentObserved)
+	rangeMin   int64
 }
 
 func New(logger *slog.Logger) *Manager {
@@ -35,7 +41,12 @@ func New(logger *slog.Logger) *Manager {
 		// Без общего timeout: модели весят десятки ГБ, отмена идёт по ctx.
 		httpClient: &http.Client{},
 		logger:     logger,
+		rangeMin:   rangeMinSize,
 	}
+}
+
+func (m *Manager) SetRangeMinForTest(n int64) {
+	m.rangeMin = n
 }
 
 func (m *Manager) SetReporter(fn func(context.Context, client.AgentContentObserved)) {
@@ -196,16 +207,47 @@ func (m *Manager) fetch(ctx context.Context, t task, onProgress func(float64)) e
 		return os.Rename(tmp, t.target)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
+	if err := m.download(ctx, t.url, tmp, onProgress); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+
+	if t.sha256 != "" {
+		sum, err := hashFile(tmp)
+		if err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("hash: %w", err)
+		}
+		if !strings.EqualFold(sum, t.sha256) {
+			os.Remove(tmp)
+			return fmt.Errorf("sha256 mismatch (got %s)", sum[:12])
+		}
+	}
+	return os.Rename(tmp, t.target)
+}
+
+func (m *Manager) download(ctx context.Context, url, tmp string, onProgress func(float64)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Range", "bytes=0-")
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
+
+	total := int64(0)
+	if resp.StatusCode == http.StatusPartialContent {
+		total = totalFromContentRange(resp.Header.Get("Content-Range"))
+		if total >= m.rangeMin {
+			resp.Body.Close()
+			return m.downloadRanged(ctx, url, tmp, total, onProgress)
+		}
+	}
+
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("http %d", resp.StatusCode)
 	}
 
@@ -213,26 +255,113 @@ func (m *Manager) fetch(ctx context.Context, t task, onProgress func(float64)) e
 	if err != nil {
 		return fmt.Errorf("create: %w", err)
 	}
-	hasher := sha256.New()
 	pw := &progressWriter{total: resp.ContentLength, onProgress: onProgress, throttle: reportInterval}
-	if _, err := io.Copy(io.MultiWriter(out, hasher, pw), resp.Body); err != nil {
+	written, err := io.Copy(io.MultiWriter(out, pw), resp.Body)
+	if err != nil {
 		out.Close()
-		os.Remove(tmp)
 		return fmt.Errorf("download: %w", err)
 	}
 	if err := out.Close(); err != nil {
-		os.Remove(tmp)
 		return fmt.Errorf("close: %w", err)
 	}
+	if total > 0 && written != total {
+		return fmt.Errorf("download: got %d of %d bytes", written, total)
+	}
+	return nil
+}
 
-	if t.sha256 != "" {
-		sum := hex.EncodeToString(hasher.Sum(nil))
-		if !strings.EqualFold(sum, t.sha256) {
-			os.Remove(tmp)
-			return fmt.Errorf("sha256 mismatch (got %s)", sum[:12])
+func totalFromContentRange(v string) int64 {
+	i := strings.LastIndex(v, "/")
+	if i < 0 {
+		return 0
+	}
+	total, err := strconv.ParseInt(strings.TrimSpace(v[i+1:]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return total
+}
+
+func (m *Manager) downloadRanged(ctx context.Context, url, tmp string, size int64, onProgress func(float64)) error {
+	out, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("create: %w", err)
+	}
+	if err := out.Truncate(size); err != nil {
+		out.Close()
+		return fmt.Errorf("truncate: %w", err)
+	}
+
+	partCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	pw := &progressWriter{total: size, onProgress: onProgress, throttle: reportInterval}
+	chunk := size / rangeParts
+	errs := make([]error, rangeParts)
+	var wg sync.WaitGroup
+	for i := range rangeParts {
+		start := int64(i) * chunk
+		end := start + chunk - 1
+		if i == rangeParts-1 {
+			end = size - 1
+		}
+		wg.Add(1)
+		go func(idx int, from, to int64) {
+			defer wg.Done()
+			if err := m.downloadPart(partCtx, url, out, from, to, pw); err != nil {
+				errs[idx] = err
+				cancel()
+			}
+		}(i, start, end)
+	}
+	wg.Wait()
+
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close: %w", err)
+	}
+	for _, e := range errs {
+		if e != nil {
+			return fmt.Errorf("download: %w", e)
 		}
 	}
-	return os.Rename(tmp, t.target)
+	return nil
+}
+
+func (m *Manager) downloadPart(ctx context.Context, url string, out *os.File, from, to int64, pw *progressWriter) error {
+	var lastErr error
+	for attempt := 0; attempt < rangeAttempts; attempt++ {
+		n, err := m.downloadRange(ctx, url, out, from, to, pw)
+		from += n
+		if from > to {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		lastErr = fmt.Errorf("short body: %d bytes missing", to-from+1)
+	}
+	return lastErr
+}
+
+func (m *Manager) downloadRange(ctx context.Context, url string, out *os.File, from, to int64, pw *progressWriter) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, to))
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("http %d for range %d-%d", resp.StatusCode, from, to)
+	}
+	return io.Copy(io.MultiWriter(io.NewOffsetWriter(out, from), pw), resp.Body)
 }
 
 func (m *Manager) clone(ctx context.Context, t task) error {
@@ -259,8 +388,9 @@ func (m *Manager) report(ctx context.Context, state string, progress *int, detai
 }
 
 type progressWriter struct {
+	mu         sync.Mutex
 	onProgress func(float64)
-	total      int64 // Content-Length; <=0 если сервер не отдал
+	total      int64
 	read       int64
 	last       time.Time
 	throttle   time.Duration
@@ -268,13 +398,20 @@ type progressWriter struct {
 
 func (p *progressWriter) Write(b []byte) (int, error) {
 	n := len(b)
+
+	p.mu.Lock()
 	p.read += int64(n)
-	if p.onProgress != nil && time.Since(p.last) >= p.throttle {
+	report := p.onProgress != nil && time.Since(p.last) >= p.throttle
+	frac := 0.0
+	if report {
 		p.last = time.Now()
-		frac := 0.0
 		if p.total > 0 {
 			frac = float64(p.read) / float64(p.total)
 		}
+	}
+	p.mu.Unlock()
+
+	if report {
 		p.onProgress(frac)
 	}
 	return n, nil

@@ -36,7 +36,7 @@ type DiskManager interface {
 }
 
 type ContainerReconciler interface {
-	Reconcile(ctx context.Context, spec *client.AgentContainerSpec) client.AgentContainerObserved
+	Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved
 	SetReporter(func(context.Context, client.AgentContainerObserved))
 }
 
@@ -345,20 +345,26 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 
 		a.refreshCredsIfDiskSetChanged(ctx, spec)
 		disksObserved = a.reconcileDisks(ctx, spec)
-		// App-контент (workflow + модели) кладём в /workspace ДО старта контейнера, чтобы
-		// ComfyUI на первом запуске уже видел граф и веса. Ошибка докачки не блокирует контейнер —
-		// репортим content=error и поднимаем приложение (degraded), а не бриковаем инстанс.
+
+		contentDone := make(chan struct{})
 		if a.cfg.Content != nil && spec.Content != nil {
-			obs := a.cfg.Content.Reconcile(ctx, spec.Content, spec.Container)
-			contentObserved = &obs
-			if obs.ObservedState == client.ContentError {
-				a.cfg.Logger.Error("content reconcile failed", "err", deref(obs.LastError))
-			}
+			go func() {
+				defer close(contentDone)
+				obs := a.cfg.Content.Reconcile(ctx, spec.Content, spec.Container)
+				contentObserved = &obs
+				if obs.ObservedState == client.ContentError {
+					a.cfg.Logger.Error("content reconcile failed", "err", deref(obs.LastError))
+				}
+			}()
+		} else {
+			close(contentDone)
 		}
+
 		if a.cfg.Container != nil {
-			obs := a.cfg.Container.Reconcile(ctx, spec.Container)
+			obs := a.cfg.Container.Reconcile(ctx, spec.Container, func() { <-contentDone })
 			containerObserved = &obs
 		}
+		<-contentDone
 		if a.cfg.Firewall != nil && spec.Firewall != nil {
 			obs := a.cfg.Firewall.Reconcile(ctx, spec.Firewall)
 			firewallObserved = &obs
