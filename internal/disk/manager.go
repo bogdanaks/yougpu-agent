@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -378,6 +380,40 @@ func (m *Manager) rcReload(ctx context.Context, port int, creds *client.StorageC
 		return fmt.Errorf("rc status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (m *Manager) PendingUploads(ctx context.Context, driveID string) (int, error) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/vfs/stats", m.RcPortFor(driveID))
+	rctx, cancel := context.WithTimeout(ctx, rcReloadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodPost, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("rc dial: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("rc status %d", resp.StatusCode)
+	}
+	var stats struct {
+		DiskCache *struct {
+			UploadsInProgress int `json:"uploadsInProgress"`
+			UploadsQueued     int `json:"uploadsQueued"`
+		} `json:"diskCache"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return 0, fmt.Errorf("rc stats: %w", err)
+	}
+	if stats.DiskCache == nil {
+		return 0, nil
+	}
+	return stats.DiskCache.UploadsInProgress + stats.DiskCache.UploadsQueued, nil
 }
 
 func (m *Manager) restartUnit(ctx context.Context, driveID string) error {

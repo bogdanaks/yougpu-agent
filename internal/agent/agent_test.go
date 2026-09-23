@@ -60,9 +60,10 @@ type fakeDisk struct {
 	listCalled bool
 }
 
-func (f *fakeDisk) Mount(context.Context, client.AgentDiskSpec) error { return nil }
-func (f *fakeDisk) Unmount(context.Context, string) error             { return nil }
-func (f *fakeDisk) IsActive(context.Context, string) (bool, error)    { return false, nil }
+func (f *fakeDisk) Mount(context.Context, client.AgentDiskSpec) error   { return nil }
+func (f *fakeDisk) Unmount(context.Context, string) error               { return nil }
+func (f *fakeDisk) IsActive(context.Context, string) (bool, error)      { return false, nil }
+func (f *fakeDisk) PendingUploads(context.Context, string) (int, error) { return 0, nil }
 func (f *fakeDisk) ListUnits() ([]string, error) {
 	if !f.listCalled {
 		f.rec.add("disk")
@@ -294,6 +295,43 @@ func TestHandleSpecPullsWhileContentDownloads(t *testing.T) {
 	posted := cl.posted()
 	if len(posted) == 0 || posted[len(posted)-1].Content == nil {
 		t.Fatalf("final status must carry the content block, got %d statuses", len(posted))
+	}
+}
+
+func TestHandleSpecStartsContainerWhenModelDownloadFails(t *testing.T) {
+	rec := &recorder{}
+	pullSeen := make(chan struct{})
+	cl := &fakeClient{}
+	failed := "flux.safetensors: http 401"
+	a := New(Config{
+		Client:    cl,
+		Disk:      &fakeDisk{rec: rec},
+		Container: &gatedContainer{rec: rec, pullSeen: pullSeen},
+		Firewall:  &fakeFirewall{rec: rec},
+		HostSetup: &fakeHostSetup{rec: rec, obs: client.AgentSetupObserved{ObservedState: client.SetupReady}},
+		Content:   &fakeContent{rec: rec, pullSeen: pullSeen, obs: client.AgentContentObserved{ObservedState: client.ContentError, LastError: &failed}},
+		Lifecycle: fakeLifecycle{},
+		Creds:     fakeCreds{},
+		Logger:    testLogger(),
+	})
+	spec := specWithWork()
+	spec.Content = &client.AgentContentSpec{Models: []client.ContentModel{{URL: "http://x/flux.safetensors", Name: "flux.safetensors"}}}
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+
+	if rec.index("run") < 0 {
+		t.Fatalf("container must start even if a model failed, got %v", rec.list())
+	}
+	posted := cl.posted()
+	last := posted[len(posted)-1]
+	if last.Content == nil || last.Content.ObservedState != client.ContentError || last.Content.LastError == nil || *last.Content.LastError != failed {
+		t.Fatalf("final status must carry the download error for the backend, got %+v", last.Content)
+	}
+	if last.Container == nil || last.Container.ObservedState != client.ContainerReady {
+		t.Fatalf("container must be reported ready, got %+v", last.Container)
 	}
 }
 

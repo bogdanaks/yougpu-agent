@@ -33,6 +33,7 @@ type DiskManager interface {
 	Unmount(ctx context.Context, id string) error
 	ListUnits() ([]string, error)
 	IsActive(ctx context.Context, id string) (bool, error)
+	PendingUploads(ctx context.Context, id string) (int, error)
 }
 
 type ContainerReconciler interface {

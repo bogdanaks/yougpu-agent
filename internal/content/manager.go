@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
@@ -27,6 +29,7 @@ const (
 	rangeParts             = 4
 	rangeMinSize           = 64 << 20
 	rangeAttempts          = 3
+	idleTimeout            = time.Minute
 )
 
 type Manager struct {
@@ -34,6 +37,7 @@ type Manager struct {
 	logger     *slog.Logger
 	reporter   func(context.Context, client.AgentContentObserved)
 	rangeMin   int64
+	idle       time.Duration
 }
 
 func New(logger *slog.Logger) *Manager {
@@ -42,11 +46,16 @@ func New(logger *slog.Logger) *Manager {
 		httpClient: &http.Client{},
 		logger:     logger,
 		rangeMin:   rangeMinSize,
+		idle:       idleTimeout,
 	}
 }
 
 func (m *Manager) SetRangeMinForTest(n int64) {
 	m.rangeMin = n
+}
+
+func (m *Manager) SetIdleTimeoutForTest(d time.Duration) {
+	m.idle = d
 }
 
 func (m *Manager) SetReporter(fn func(context.Context, client.AgentContentObserved)) {
@@ -104,6 +113,7 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContentSpec, 
 	prep := "подготовка"
 	m.report(ctx, client.ContentDownloading, ptr(0), &prep)
 
+	var failed []string
 	for i, t := range pending {
 		detail := t.label
 		m.report(ctx, client.ContentDownloading, ptr(clamp(i*100/total)), &detail)
@@ -119,12 +129,19 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContentSpec, 
 				return errObs("cancelled")
 			}
 			m.logger.Error("content fetch failed", "label", t.label, "err", err)
-			return errObs(fmt.Sprintf("%s: %s", t.label, truncate(err.Error(), 200)))
+			failed = append(failed, fmt.Sprintf("%s: %s", t.label, truncate(err.Error(), 200)))
 		}
+	}
+	if len(failed) > 0 {
+		obs := errObs(strings.Join(failed, "; "))
+		m.reportObs(ctx, obs)
+		return obs
 	}
 
 	m.logger.Info("content ready", "items", total)
-	return ready(nil)
+	obs := ready(nil)
+	m.reportObs(ctx, obs)
+	return obs
 }
 
 // plan фильтрует уже присутствующие файлы (дедуп по sha256 / размеру / существованию).
@@ -178,6 +195,9 @@ func (m *Manager) modelPresent(target string, mdl client.ContentModel) bool {
 	if err != nil {
 		return false
 	}
+	if info.Size() == 0 {
+		return false
+	}
 	if mdl.SHA256 != "" {
 		sum, err := hashFile(target)
 		if err != nil {
@@ -227,12 +247,7 @@ func (m *Manager) fetch(ctx context.Context, t task, onProgress func(float64)) e
 }
 
 func (m *Manager) download(ctx context.Context, url, tmp string, onProgress func(float64)) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Range", "bytes=0-")
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.get(ctx, url, "bytes=0-")
 	if err != nil {
 		return err
 	}
@@ -348,12 +363,7 @@ func (m *Manager) downloadPart(ctx context.Context, url string, out *os.File, fr
 }
 
 func (m *Manager) downloadRange(ctx context.Context, url string, out *os.File, from, to int64, pw *progressWriter) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, to))
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.get(ctx, url, fmt.Sprintf("bytes=%d-%d", from, to))
 	if err != nil {
 		return 0, err
 	}
@@ -362,6 +372,71 @@ func (m *Manager) downloadRange(ctx context.Context, url string, out *os.File, f
 		return 0, fmt.Errorf("http %d for range %d-%d", resp.StatusCode, from, to)
 	}
 	return io.Copy(io.MultiWriter(io.NewOffsetWriter(out, from), pw), resp.Body)
+}
+
+func (m *Manager) get(ctx context.Context, url, rng string) (*http.Response, error) {
+	reqCtx, watch := newIdleWatch(ctx, m.idle)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		watch.stop()
+		return nil, err
+	}
+	req.Header.Set("Range", rng)
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		watch.stop()
+		return nil, watch.explain(err)
+	}
+	resp.Body = &idleBody{ReadCloser: resp.Body, watch: watch}
+	return resp, nil
+}
+
+type idleWatch struct {
+	idle   time.Duration
+	cancel context.CancelFunc
+	timer  *time.Timer
+	fired  atomic.Bool
+}
+
+func newIdleWatch(ctx context.Context, idle time.Duration) (context.Context, *idleWatch) {
+	reqCtx, cancel := context.WithCancel(ctx)
+	w := &idleWatch{idle: idle, cancel: cancel}
+	w.timer = time.AfterFunc(idle, func() {
+		w.fired.Store(true)
+		cancel()
+	})
+	return reqCtx, w
+}
+
+func (w *idleWatch) explain(err error) error {
+	if err != nil && !errors.Is(err, io.EOF) && w.fired.Load() {
+		return fmt.Errorf("no data for %s", w.idle)
+	}
+	return err
+}
+
+func (w *idleWatch) stop() {
+	w.timer.Stop()
+	w.cancel()
+}
+
+type idleBody struct {
+	io.ReadCloser
+	watch *idleWatch
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.watch.timer.Reset(b.watch.idle)
+	}
+	return n, b.watch.explain(err)
+}
+
+func (b *idleBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.watch.stop()
+	return err
 }
 
 func (m *Manager) clone(ctx context.Context, t task) error {
@@ -381,10 +456,14 @@ func (m *Manager) clone(ctx context.Context, t task) error {
 }
 
 func (m *Manager) report(ctx context.Context, state string, progress *int, detail *string) {
+	m.reportObs(ctx, client.AgentContentObserved{ObservedState: state, Progress: progress, Detail: detail})
+}
+
+func (m *Manager) reportObs(ctx context.Context, obs client.AgentContentObserved) {
 	if m.reporter == nil {
 		return
 	}
-	m.reporter(ctx, client.AgentContentObserved{ObservedState: state, Progress: progress, Detail: detail})
+	m.reporter(ctx, obs)
 }
 
 type progressWriter struct {

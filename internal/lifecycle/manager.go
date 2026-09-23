@@ -27,6 +27,7 @@ const (
 
 type Disker interface {
 	ListUnits() ([]string, error)
+	PendingUploads(ctx context.Context, id string) (int, error)
 }
 
 type SystemdStopper interface {
@@ -73,13 +74,7 @@ func (m *Manager) HandleTermination(ctx context.Context, disker Disker) (string,
 	case StateSynced, StateDestroyingSelf:
 		return StateSynced, nil
 	case StateSyncing:
-		if err := m.flushStorageUnits(ctx, disker); err != nil {
-			return StateSyncing, err
-		}
-		if err := m.SetState(StateSynced); err != nil {
-			return StateSynced, fmt.Errorf("persist synced state: %w", err)
-		}
-		return StateSynced, nil
+		return m.finishSync(ctx, disker)
 	default:
 		if err := m.SetState(StateSyncing); err != nil {
 			return StateAlive, fmt.Errorf("persist syncing state: %w", err)
@@ -87,14 +82,42 @@ func (m *Manager) HandleTermination(ctx context.Context, disker Disker) (string,
 		if err := m.stopContainers(ctx); err != nil {
 			m.log.Warn("docker stop returned error (continuing)", "err", err)
 		}
-		if err := m.flushStorageUnits(ctx, disker); err != nil {
-			return StateSyncing, err
-		}
-		if err := m.SetState(StateSynced); err != nil {
-			return StateSynced, fmt.Errorf("persist synced state: %w", err)
-		}
-		return StateSynced, nil
+		return m.finishSync(ctx, disker)
 	}
+}
+
+func (m *Manager) finishSync(ctx context.Context, disker Disker) (string, error) {
+	pending, err := m.pendingUploads(ctx, disker)
+	if err != nil {
+		return StateSyncing, err
+	}
+	if pending > 0 {
+		m.log.Info("waiting for storage uploads before unmount", "pending", pending)
+		return StateSyncing, nil
+	}
+	if err := m.flushStorageUnits(ctx, disker); err != nil {
+		return StateSyncing, err
+	}
+	if err := m.SetState(StateSynced); err != nil {
+		return StateSynced, fmt.Errorf("persist synced state: %w", err)
+	}
+	return StateSynced, nil
+}
+
+func (m *Manager) pendingUploads(ctx context.Context, disker Disker) (int, error) {
+	ids, err := disker.ListUnits()
+	if err != nil {
+		return 0, fmt.Errorf("list units: %w", err)
+	}
+	total := 0
+	for _, id := range ids {
+		n, err := disker.PendingUploads(ctx, id)
+		if err != nil {
+			return 0, fmt.Errorf("uploads of %s: %w", id, err)
+		}
+		total += n
+	}
+	return total, nil
 }
 
 func (m *Manager) Poweroff(ctx context.Context) error {
