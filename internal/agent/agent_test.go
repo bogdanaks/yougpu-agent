@@ -88,11 +88,12 @@ type fakeContainer struct {
 	called bool
 }
 
-func (f *fakeContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved {
+func (f *fakeContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func() bool) client.AgentContainerObserved {
 	f.called = true
 	f.rec.add("container")
-	if beforeStart != nil {
-		beforeStart()
+	if beforeStart != nil && !beforeStart() {
+		f.rec.add("gate-closed")
+		return client.AgentContainerObserved{ObservedState: client.ContainerPulling}
 	}
 	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
 }
@@ -134,9 +135,37 @@ type fakeLifecycle struct{}
 func (fakeLifecycle) CurrentState() string           { return lifecycle.StateAlive }
 func (fakeLifecycle) SetState(string) error          { return nil }
 func (fakeLifecycle) Poweroff(context.Context) error { return nil }
-func (fakeLifecycle) HandleTermination(context.Context, lifecycle.Disker) (string, error) {
+func (fakeLifecycle) HandleTermination(ctx context.Context, _ lifecycle.Disker, hooks lifecycle.Hooks) (string, error) {
+	if hooks.BeforeStop != nil {
+		hooks.BeforeStop(ctx)
+	}
+	if hooks.AfterStop != nil {
+		hooks.AfterStop(ctx)
+	}
 	return lifecycle.StateSynced, nil
 }
+
+type fakeState struct {
+	rec       *recorder
+	restoreOK bool
+	obs       *client.AgentStateObserved
+}
+
+func (f *fakeState) Restore(context.Context, *client.AgentStateSpec, *client.AgentContainerSpec) (bool, *client.AgentStateObserved) {
+	f.rec.add("restore")
+	return f.restoreOK, f.obs
+}
+
+func (f *fakeState) Freeze(_ context.Context, _ *client.AgentStateSpec, name string) {
+	f.rec.add("freeze " + name)
+}
+
+func (f *fakeState) Save(context.Context, *client.AgentStateSpec, *client.AgentContainerSpec) *client.AgentStateObserved {
+	f.rec.add("save")
+	return &client.AgentStateObserved{ObservedState: client.StateSaved}
+}
+
+func (f *fakeState) SetReporter(func(context.Context, client.AgentStateObserved)) {}
 
 type fakeCreds struct{}
 
@@ -241,11 +270,11 @@ type gatedContainer struct {
 	pullSeen chan struct{}
 }
 
-func (g *gatedContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved {
+func (g *gatedContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func() bool) client.AgentContainerObserved {
 	g.rec.add("pull")
 	close(g.pullSeen)
-	if beforeStart != nil {
-		beforeStart()
+	if beforeStart != nil && !beforeStart() {
+		return client.AgentContainerObserved{ObservedState: client.ContainerPulling}
 	}
 	g.rec.add("run")
 	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
@@ -393,5 +422,81 @@ func TestHandleSpecAppliesSSHKeysBeforeHostIsReady(t *testing.T) {
 	}
 	if rec.index("sshkeys") > rec.index("hostsetup") {
 		t.Errorf("ssh keys must not wait for host setup, order = %v", rec.list())
+	}
+}
+
+func stateAgent(rec *recorder, st *fakeState) (*Agent, *fakeClient) {
+	cl := &fakeClient{}
+	a := New(Config{
+		Client:    cl,
+		Disk:      &fakeDisk{rec: rec},
+		Container: &fakeContainer{rec: rec},
+		Firewall:  &fakeFirewall{rec: rec},
+		HostSetup: &fakeHostSetup{rec: rec, obs: client.AgentSetupObserved{ObservedState: client.SetupReady}},
+		State:     st,
+		Lifecycle: fakeLifecycle{},
+		Creds:     fakeCreds{},
+		Logger:    testLogger(),
+	})
+	return a, cl
+}
+
+func TestContainerWaitsForWorkspaceState(t *testing.T) {
+	rec := &recorder{}
+	a, cl := stateAgent(rec, &fakeState{rec: rec, obs: &client.AgentStateObserved{ObservedState: client.StateWaiting}})
+	spec := specWithWork()
+	spec.State = &client.AgentStateSpec{Pending: true}
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+
+	if rec.index("gate-closed") < 0 {
+		t.Fatalf("container must not start before the state is restored, got %v", rec.list())
+	}
+	last := cl.posted()[len(cl.posted())-1]
+	if last.State == nil || last.State.ObservedState != client.StateWaiting {
+		t.Fatalf("final status must carry the state, got %+v", last.State)
+	}
+	if last.Container == nil || last.Container.ObservedState != client.ContainerPulling {
+		t.Fatalf("container must stay pulling, got %+v", last.Container)
+	}
+}
+
+func TestSpecWithoutStateSkipsRestore(t *testing.T) {
+	rec := &recorder{}
+	a, _ := stateAgent(rec, &fakeState{rec: rec})
+	spec := specWithWork()
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+	if rec.index("restore") >= 0 || rec.index("gate-closed") >= 0 {
+		t.Fatalf("state must not gate a spec without it, got %v", rec.list())
+	}
+}
+
+func TestTerminationFreezesThenSavesState(t *testing.T) {
+	rec := &recorder{}
+	a, cl := stateAgent(rec, &fakeState{rec: rec})
+	requested := time.Now().Format(time.RFC3339)
+	spec := specWithWork()
+	spec.Lifecycle.DeletionRequestedAt = &requested
+	spec.State = &client.AgentStateSpec{Save: &client.StateSave{UploadURL: "http://b2/put"}}
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+
+	freeze, save := rec.index("freeze app_container"), rec.index("save")
+	if freeze < 0 || save < 0 || freeze > save {
+		t.Fatalf("want freeze then save, got %v", rec.list())
+	}
+	last := cl.posted()[len(cl.posted())-1]
+	if last.State == nil || last.State.ObservedState != client.StateSaved {
+		t.Fatalf("final status must carry the saved state, got %+v", last.State)
 	}
 }

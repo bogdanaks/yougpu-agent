@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/container"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/reconcile"
 )
@@ -37,7 +38,7 @@ type DiskManager interface {
 }
 
 type ContainerReconciler interface {
-	Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved
+	Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func() bool) client.AgentContainerObserved
 	SetReporter(func(context.Context, client.AgentContainerObserved))
 }
 
@@ -67,8 +68,15 @@ type ContentReconciler interface {
 type LifecycleManager interface {
 	CurrentState() string
 	SetState(state string) error
-	HandleTermination(ctx context.Context, disker lifecycle.Disker) (string, error)
+	HandleTermination(ctx context.Context, disker lifecycle.Disker, hooks lifecycle.Hooks) (string, error)
 	Poweroff(ctx context.Context) error
+}
+
+type StateManager interface {
+	Restore(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec) (bool, *client.AgentStateObserved)
+	Freeze(ctx context.Context, spec *client.AgentStateSpec, containerName string)
+	Save(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec) *client.AgentStateObserved
+	SetReporter(func(context.Context, client.AgentStateObserved))
 }
 
 type CredsProvider interface {
@@ -89,6 +97,7 @@ type Config struct {
 	Tunnel            TunnelReconciler
 	HostSetup         HostSetup
 	Content           ContentReconciler
+	State             StateManager
 	SSHKeys           SSHKeysReconciler
 	Lifecycle         LifecycleManager
 	Creds             CredsProvider
@@ -127,7 +136,43 @@ func New(cfg Config) *Agent {
 	if cfg.Content != nil {
 		cfg.Content.SetReporter(a.reportContentPhase)
 	}
+	if cfg.State != nil {
+		cfg.State.SetReporter(a.reportStatePhase)
+	}
 	return a
+}
+
+func (a *Agent) reportStatePhase(ctx context.Context, obs client.AgentStateObserved) {
+	if a.lastSpec == nil {
+		return
+	}
+	status := &client.AgentStatus{
+		ObservedGeneration: a.lastSpec.Generation,
+		Lifecycle:          client.StatusLifecycle{ObservedState: a.cfg.Lifecycle.CurrentState()},
+		State:              &obs,
+		AgentVersion:       a.cfg.Version,
+		UptimeSec:          int64(time.Since(a.started).Seconds()),
+	}
+	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
+		a.cfg.Logger.Warn("state phase report failed", "state", obs.ObservedState, "err", err)
+	}
+}
+
+func (a *Agent) terminationHooks(spec *client.AgentSpec, saved **client.AgentStateObserved) lifecycle.Hooks {
+	if a.cfg.State == nil || spec.State == nil || spec.State.Save == nil {
+		return lifecycle.Hooks{}
+	}
+	return lifecycle.Hooks{
+		BeforeStop: func(ctx context.Context) {
+			a.reportStatePhase(ctx, client.AgentStateObserved{ObservedState: client.StateSaving})
+			a.cfg.State.Freeze(ctx, spec.State, container.AppContainerName)
+		},
+		AfterStop: func(ctx context.Context) {
+			*saved = a.cfg.State.Save(ctx, spec.State, spec.Container)
+		},
+	}
 }
 
 func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContainerObserved) {
@@ -319,9 +364,10 @@ func (a *Agent) heartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	observedLifecycle := lifecycle.StateAlive
 	var disksObserved []client.AgentDiskObserved
+	var stateObserved *client.AgentStateObserved
 
 	if spec.Lifecycle.DeletionRequestedAt != nil {
-		state, err := a.cfg.Lifecycle.HandleTermination(ctx, a.cfg.Disk)
+		state, err := a.cfg.Lifecycle.HandleTermination(ctx, a.cfg.Disk, a.terminationHooks(spec, &stateObserved))
 		if err != nil {
 			a.cfg.Logger.Error("termination handling failed", "err", err)
 		}
@@ -372,11 +418,27 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 			close(contentDone)
 		}
 
+		stateReady := true
+		stateDone := make(chan struct{})
+		if a.cfg.State != nil && spec.State != nil {
+			go func() {
+				defer close(stateDone)
+				stateReady, stateObserved = a.cfg.State.Restore(ctx, spec.State, spec.Container)
+			}()
+		} else {
+			close(stateDone)
+		}
+
 		if a.cfg.Container != nil {
-			obs := a.cfg.Container.Reconcile(ctx, spec.Container, func() { <-contentDone })
+			obs := a.cfg.Container.Reconcile(ctx, spec.Container, func() bool {
+				<-contentDone
+				<-stateDone
+				return stateReady
+			})
 			containerObserved = &obs
 		}
 		<-contentDone
+		<-stateDone
 		if a.cfg.Firewall != nil && spec.Firewall != nil {
 			obs := a.cfg.Firewall.Reconcile(ctx, spec.Firewall)
 			firewallObserved = &obs
@@ -399,6 +461,7 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		Firewall:           firewallObserved,
 		Setup:              setupObserved,
 		Content:            contentObserved,
+		State:              stateObserved,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	})

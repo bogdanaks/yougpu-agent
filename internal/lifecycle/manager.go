@@ -30,6 +30,11 @@ type Disker interface {
 	PendingUploads(ctx context.Context, id string) (int, error)
 }
 
+type Hooks struct {
+	BeforeStop func(context.Context)
+	AfterStop  func(context.Context)
+}
+
 type SystemdStopper interface {
 	Stop(ctx context.Context, unit string) error
 	Poweroff(ctx context.Context) error
@@ -66,21 +71,27 @@ func (m *Manager) SetState(state string) error {
 	return os.Rename(tmp, m.path())
 }
 
-// HandleTermination orchestrates alive→syncing→synced.
-// Recovery: when sentinel is already "syncing", we resume from the storage-flush step
-// without re-stopping containers; when already "synced", we fast-return.
-func (m *Manager) HandleTermination(ctx context.Context, disker Disker) (string, error) {
+func (m *Manager) HandleTermination(ctx context.Context, disker Disker, hooks Hooks) (string, error) {
 	switch m.CurrentState() {
 	case StateSynced, StateDestroyingSelf:
 		return StateSynced, nil
 	case StateSyncing:
+		if hooks.AfterStop != nil {
+			hooks.AfterStop(ctx)
+		}
 		return m.finishSync(ctx, disker)
 	default:
 		if err := m.SetState(StateSyncing); err != nil {
 			return StateAlive, fmt.Errorf("persist syncing state: %w", err)
 		}
+		if hooks.BeforeStop != nil {
+			hooks.BeforeStop(ctx)
+		}
 		if err := m.stopContainers(ctx); err != nil {
 			m.log.Warn("docker stop returned error (continuing)", "err", err)
+		}
+		if hooks.AfterStop != nil {
+			hooks.AfterStop(ctx)
 		}
 		return m.finishSync(ctx, disker)
 	}

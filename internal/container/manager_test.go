@@ -153,7 +153,7 @@ func TestReconcileCallsGateBetweenPullAndRun(t *testing.T) {
 	puller := &fakePuller{order: &order}
 	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, puller, testLogger())
 
-	_ = m.Reconcile(context.Background(), spec, func() { order = append(order, "gate") })
+	_ = m.Reconcile(context.Background(), spec, func() bool { order = append(order, "gate"); return true })
 
 	pull, gate, run := -1, -1, -1
 	for i, c := range order {
@@ -174,13 +174,31 @@ func TestReconcileCallsGateBetweenPullAndRun(t *testing.T) {
 	}
 }
 
+func TestReconcileDoesNotStartWhenGateCloses(t *testing.T) {
+	spec := sampleSpec()
+	spec.Volumes = nil
+	var order []string
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, &fakePuller{order: &order}, testLogger())
+
+	obs := m.Reconcile(context.Background(), spec, func() bool { return false })
+
+	for _, c := range order {
+		if strings.Contains(c, "docker run") || strings.Contains(c, "docker rm") {
+			t.Fatalf("container touched with closed gate: %v", order)
+		}
+	}
+	if obs.ObservedState != client.ContainerPulling {
+		t.Fatalf("want pulling, got %s", obs.ObservedState)
+	}
+}
+
 func TestReconcileSkipsGateWhenNothingToApply(t *testing.T) {
 	spec := sampleSpec()
 	hash := SpecHash(spec)
 	gated := false
 	m := NewManager(scriptExec{t: t, inspect: "true|" + hash}, &fakePuller{}, testLogger())
 
-	_ = m.Reconcile(context.Background(), spec, func() { gated = true })
+	_ = m.Reconcile(context.Background(), spec, func() bool { gated = true; return true })
 
 	if gated {
 		t.Error("gate must not be called when the running container already matches the spec")

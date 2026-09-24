@@ -4,7 +4,10 @@ go 1.24.0
 
 toolchain go1.24.1
 
-require github.com/fatedier/frp v0.66.0
+require (
+	github.com/fatedier/frp v0.66.0
+	github.com/klauspost/compress v1.18.0
+)
 
 require (
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect

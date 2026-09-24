@@ -11,6 +11,26 @@ type AgentSpec struct {
 	Content    *AgentContentSpec   `json:"content"`
 	Disks      []AgentDiskSpec     `json:"disks"`
 	SSH        *AgentSSHSpec       `json:"ssh"`
+	State      *AgentStateSpec     `json:"state"`
+}
+
+type AgentStateSpec struct {
+	Include       []string      `json:"include"`
+	Exclude       []string      `json:"exclude"`
+	FreezeCommand []string      `json:"freeze_command"`
+	Pending       bool          `json:"pending"`
+	Restore       *StateRestore `json:"restore"`
+	Save          *StateSave    `json:"save"`
+}
+
+type StateRestore struct {
+	URL       string `json:"url"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+type StateSave struct {
+	UploadURL string `json:"upload_url"`
 }
 
 type AgentSSHSpec struct {
@@ -109,6 +129,7 @@ type AgentStatus struct {
 	Firewall     *AgentFirewallObserved  `json:"firewall,omitempty"`
 	Setup        *AgentSetupObserved     `json:"setup,omitempty"`
 	Content      *AgentContentObserved   `json:"content,omitempty"`
+	State        *AgentStateObserved     `json:"state,omitempty"`
 	AgentVersion string                  `json:"agent_version,omitempty"`
 	UptimeSec    int64                   `json:"uptime_sec,omitempty"`
 }
@@ -144,6 +165,13 @@ type AgentSetupObserved struct {
 	LastLog       *string `json:"last_log,omitempty"`
 }
 
+type AgentStateObserved struct {
+	ObservedState string  `json:"observed_state"`
+	SHA256        *string `json:"sha256,omitempty"`
+	SizeBytes     *int64  `json:"size_bytes,omitempty"`
+	LastError     *string `json:"last_error,omitempty"`
+}
+
 type AgentContentObserved struct {
 	ObservedState string  `json:"observed_state"`
 	Progress      *int    `json:"progress,omitempty"`
@@ -172,6 +200,14 @@ const (
 	SetupInstallingStorage = "installing_storage"
 	SetupReady             = "ready"
 	SetupError             = "error"
+
+	StateWaiting       = "waiting"
+	StateRestoring     = "restoring"
+	StateRestored      = "restored"
+	StateRestoreFailed = "restore_failed"
+	StateSaving        = "saving"
+	StateSaved         = "saved"
+	StateSaveFailed    = "save_failed"
 
 	ContentDownloading = "downloading"
 	ContentReady       = "ready"

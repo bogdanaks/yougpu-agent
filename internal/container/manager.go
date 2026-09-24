@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -17,15 +18,15 @@ import (
 )
 
 const (
-	containerName   = "app_container"
-	labelManaged    = "yougpu.managed"
-	labelSpecHash   = "yougpu.spec.hash"
-	dockerTimeout   = 5 * time.Second
-	pullTimeout     = 10 * time.Minute
-	runTimeout      = 2 * time.Minute
-	reportThrottle  = 5 * time.Second
-	inspectNoExit   = "no such object"
-	inspectNotFound = "No such object"
+	AppContainerName = "app_container"
+	labelManaged     = "yougpu.managed"
+	labelSpecHash    = "yougpu.spec.hash"
+	dockerTimeout    = 5 * time.Second
+	pullTimeout      = 10 * time.Minute
+	runTimeout       = 2 * time.Minute
+	reportThrottle   = 5 * time.Second
+	inspectNoExit    = "no such object"
+	inspectNotFound  = "No such object"
 )
 
 type Action int
@@ -51,7 +52,7 @@ type Manager struct {
 }
 
 func NewManager(exec system.Executor, puller Puller, log *slog.Logger) *Manager {
-	return &Manager{exec: exec, puller: puller, log: log, name: containerName}
+	return &Manager{exec: exec, puller: puller, log: log, name: AppContainerName}
 }
 
 func (m *Manager) SetReporter(fn func(context.Context, client.AgentContainerObserved)) {
@@ -90,7 +91,7 @@ func Decide(hasSpec bool, desiredHash string, obs Observed) Action {
 	return ActionApply
 }
 
-func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func()) client.AgentContainerObserved {
+func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func() bool) client.AgentContainerObserved {
 	hasSpec := spec != nil
 	desiredHash := SpecHash(spec)
 
@@ -116,6 +117,10 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec
 	case ActionApply:
 		m.log.Info("applying container spec", "name", m.name, "image", spec.Image, "hash", desiredHash)
 		if err := m.apply(ctx, spec, desiredHash, beforeStart); err != nil {
+			if errors.Is(err, errGateClosed) {
+				m.log.Info("container start deferred", "name", m.name)
+				return client.AgentContainerObserved{ObservedState: client.ContainerPulling, SpecHash: desiredHash}
+			}
 			m.log.Error("container apply failed", "err", err)
 			return m.errorReport(desiredHash, err)
 		}
@@ -175,7 +180,9 @@ func (m *Manager) remove(ctx context.Context) error {
 	return err
 }
 
-func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, hash string, beforeStart func()) error {
+var errGateClosed = errors.New("container start gate closed")
+
+func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, hash string, beforeStart func() bool) error {
 	for _, v := range spec.Volumes {
 		if v.Host == "" {
 			continue
@@ -210,8 +217,8 @@ func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, ha
 		return fmt.Errorf("pull %s: %w", spec.Image, err)
 	}
 
-	if beforeStart != nil {
-		beforeStart()
+	if beforeStart != nil && !beforeStart() {
+		return errGateClosed
 	}
 
 	if err := m.remove(ctx); err != nil {
