@@ -10,6 +10,12 @@ type AgentSpec struct {
 	Tunnel     *AgentTunnelSpec    `json:"tunnel"`
 	Content    *AgentContentSpec   `json:"content"`
 	Disks      []AgentDiskSpec     `json:"disks"`
+	SSH        *AgentSSHSpec       `json:"ssh"`
+}
+
+type AgentSSHSpec struct {
+	User           string   `json:"user"`
+	AuthorizedKeys []string `json:"authorized_keys"`
 }
 
 type AgentContentSpec struct {

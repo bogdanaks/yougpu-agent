@@ -55,6 +55,17 @@ func (f *fakeHostSetup) Reconcile(_ context.Context) client.AgentSetupObserved {
 }
 func (f *fakeHostSetup) SetReporter(func(context.Context, client.AgentSetupObserved)) {}
 
+type fakeSSHKeys struct {
+	rec  *recorder
+	spec *client.AgentSSHSpec
+}
+
+func (f *fakeSSHKeys) Reconcile(spec *client.AgentSSHSpec) error {
+	f.spec = spec
+	f.rec.add("sshkeys")
+	return nil
+}
+
 type fakeDisk struct {
 	rec        *recorder
 	listCalled bool
@@ -361,5 +372,26 @@ func TestHandleSpecWaitsForContentWhenContainerUnchanged(t *testing.T) {
 	posted := cl.posted()
 	if len(posted) == 0 || posted[len(posted)-1].Content == nil {
 		t.Fatalf("content result must be reported even without a container, got %d statuses", len(posted))
+	}
+}
+
+func TestHandleSpecAppliesSSHKeysBeforeHostIsReady(t *testing.T) {
+	rec := &recorder{}
+	a, _, _, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupInstallingDocker})
+	keys := &fakeSSHKeys{rec: rec}
+	a.cfg.SSHKeys = keys
+	spec := specWithWork()
+	spec.SSH = &client.AgentSSHSpec{User: "ubuntu", AuthorizedKeys: []string{"ssh-ed25519 AAAA me@mac"}}
+	a.lastSpec = spec
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatalf("handleSpec: %v", err)
+	}
+
+	if keys.spec != spec.SSH {
+		t.Fatal("ssh keys from spec must be applied")
+	}
+	if rec.index("sshkeys") > rec.index("hostsetup") {
+		t.Errorf("ssh keys must not wait for host setup, order = %v", rec.list())
 	}
 }

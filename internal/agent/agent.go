@@ -45,6 +45,10 @@ type FirewallReconciler interface {
 	Reconcile(ctx context.Context, spec *client.AgentFirewallSpec) client.AgentFirewallObserved
 }
 
+type SSHKeysReconciler interface {
+	Reconcile(spec *client.AgentSSHSpec) error
+}
+
 type TunnelReconciler interface {
 	Reconcile(ctx context.Context, spec *client.AgentTunnelSpec)
 	Ready(subdomains []string) bool
@@ -85,6 +89,7 @@ type Config struct {
 	Tunnel            TunnelReconciler
 	HostSetup         HostSetup
 	Content           ContentReconciler
+	SSHKeys           SSHKeysReconciler
 	Lifecycle         LifecycleManager
 	Creds             CredsProvider
 	Logger            *slog.Logger
@@ -329,6 +334,12 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	var contentObserved *client.AgentContentObserved
 	if spec.Lifecycle.DeletionRequestedAt == nil {
 		_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
+
+		if a.cfg.SSHKeys != nil && spec.SSH != nil {
+			if err := a.cfg.SSHKeys.Reconcile(spec.SSH); err != nil {
+				a.cfg.Logger.Error("ssh keys reconcile failed", "err", err)
+			}
+		}
 
 		if a.cfg.HostSetup != nil {
 			obs := a.cfg.HostSetup.Reconcile(ctx)
