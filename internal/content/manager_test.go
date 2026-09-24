@@ -264,7 +264,7 @@ func modelSpec(url string, body []byte) *client.AgentContentSpec {
 	}
 }
 
-func TestFetchRangedMatchesSingleStream(t *testing.T) {
+func TestFetchRangedSplitsIntoEightParts(t *testing.T) {
 	root := t.TempDir()
 	body := randomBody(1 << 20)
 
@@ -294,8 +294,8 @@ func TestFetchRangedMatchesSingleStream(t *testing.T) {
 	if !bytes.Equal(got, body) {
 		t.Fatalf("ranged download differs from source (got %d bytes, want %d)", len(got), len(body))
 	}
-	if rangeGets != rangeParts {
-		t.Errorf("expected %d ranged GETs, got %d", rangeParts, rangeGets)
+	if rangeGets != 8 {
+		t.Errorf("expected 8 ranged GETs, got %d", rangeGets)
 	}
 }
 

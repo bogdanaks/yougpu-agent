@@ -26,7 +26,7 @@ const (
 	WorkspaceContainerPath = "/workspace"
 	dirPerm                = 0o777
 	reportInterval         = 2 * time.Second
-	rangeParts             = 4
+	rangeParts             = 8
 	rangeMinSize           = 64 << 20
 	rangeAttempts          = 3
 	idleTimeout            = time.Minute

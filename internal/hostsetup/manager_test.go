@@ -2,9 +2,12 @@ package hostsetup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -107,10 +110,101 @@ func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...
 	return "", nil
 }
 
-func newManager(fe *fakeExec) *Manager {
+func newManager(t *testing.T, fe *fakeExec) *Manager {
+	t.Helper()
 	m := NewManager(fe, system.NewSystemd(fe, testLogger()), testLogger())
 	m.SetWaitsForTest(0, 5, 3)
+	withDockerConfig(t, m, `{"max-concurrent-downloads": 8}`)
 	return m
+}
+
+func withDockerConfig(t *testing.T, m *Manager, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	if content != "" {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.SetDockerConfigForTest(path)
+	return path
+}
+
+func readDockerConfig(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read docker config: %v", err)
+	}
+	cfg := map[string]any{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse docker config: %v (%s)", err, data)
+	}
+	return cfg
+}
+
+func readyHost(calls *[]string) *fakeExec {
+	return &fakeExec{
+		calls:          calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "nvidia-ctk": true},
+		gpu:            true,
+		dockerUp:       true,
+		rcloneOK:       true,
+		fuseOK:         true,
+		aptConfPresent: true,
+		nvidiaRuntime:  []bool{true},
+	}
+}
+
+func TestReconcileRaisesDockerPullConcurrencyKeepingOtherSettings(t *testing.T) {
+	var calls []string
+	m := newManager(t, readyHost(&calls))
+	path := withDockerConfig(t, m, `{"runtimes": {"nvidia": {"path": "nvidia-container-runtime", "args": []}}, "default-runtime": "nvidia"}`)
+
+	obs := m.Reconcile(context.Background())
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("expected ready, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	cfg := readDockerConfig(t, path)
+	if cfg["max-concurrent-downloads"] != float64(8) {
+		t.Errorf("max-concurrent-downloads must be 8, got %v", cfg["max-concurrent-downloads"])
+	}
+	if cfg["default-runtime"] != "nvidia" || cfg["runtimes"] == nil {
+		t.Errorf("existing settings must survive, got %v", cfg)
+	}
+	j := joined(calls)
+	if !strings.Contains(j, "systemctl stop docker") || !strings.Contains(j, "systemctl start docker") {
+		t.Errorf("docker must be restarted to apply the setting, calls: %s", j)
+	}
+	if strings.Contains(j, "get.docker.com") {
+		t.Errorf("running docker must not be reinstalled, calls: %s", j)
+	}
+}
+
+func TestReconcileCreatesDockerConfigWhenMissing(t *testing.T) {
+	var calls []string
+	m := newManager(t, readyHost(&calls))
+	path := withDockerConfig(t, m, "")
+
+	if obs := m.Reconcile(context.Background()); obs.ObservedState != client.SetupReady {
+		t.Fatalf("expected ready, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	if cfg := readDockerConfig(t, path); cfg["max-concurrent-downloads"] != float64(8) {
+		t.Errorf("max-concurrent-downloads must be 8, got %v", cfg)
+	}
+}
+
+func TestReconcileKeepsTunedDockerRunning(t *testing.T) {
+	var calls []string
+	m := newManager(t, readyHost(&calls))
+	withDockerConfig(t, m, `{"max-concurrent-downloads": 16}`)
+
+	if obs := m.Reconcile(context.Background()); obs.ObservedState != client.SetupReady {
+		t.Fatalf("expected ready, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	if j := joined(calls); strings.Contains(j, "systemctl stop docker") {
+		t.Errorf("tuned docker must not be restarted, calls: %s", j)
+	}
 }
 
 func joined(calls []string) string { return strings.Join(calls, " | ") }
@@ -127,7 +221,7 @@ func TestReconcileReadyHostIsNoop(t *testing.T) {
 		aptConfPresent: true,
 		nvidiaRuntime:  []bool{true},
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("ready host → ready, got %s", obs.ObservedState)
 	}
@@ -150,7 +244,7 @@ func TestReconcileFreshHostRunsAllStepsInOrder(t *testing.T) {
 		fuseOK:        false,
 		nvidiaRuntime: []bool{true},
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("fresh host → ready, got %s (err %v)", obs.ObservedState, obs.LastError)
 	}
@@ -176,7 +270,7 @@ func TestReconcileSkipsNvidiaWhenNoGPU(t *testing.T) {
 		rcloneOK: true,
 		fuseOK:   true,
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("expected ready, got %s", obs.ObservedState)
 	}
@@ -197,7 +291,7 @@ func TestReconcileDockerHardResetAndRuntimeWait(t *testing.T) {
 		fuseOK:        true,
 		nvidiaRuntime: []bool{false, false, true},
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("runtime appears → ready, got %s (err %v)", obs.ObservedState, obs.LastError)
 	}
@@ -216,7 +310,7 @@ func TestReconcileNvidiaRuntimeNeverAppearsIsError(t *testing.T) {
 		fuseOK:        true,
 		nvidiaRuntime: []bool{false},
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupError {
 		t.Fatalf("runtime never appears must be error (no false-green GPU), got %s", obs.ObservedState)
 	}
@@ -233,7 +327,7 @@ func TestReconcileStopsOnFirstErrorAndReportsBundle(t *testing.T) {
 		dockerUp:     true,
 		failContains: "install -y gnupg",
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupError {
 		t.Fatalf("failed step → error, got %s", obs.ObservedState)
 	}
@@ -259,7 +353,7 @@ func TestAptCallsAlwaysWaitForDpkgLock(t *testing.T) {
 		fuseOK:        false,
 		nvidiaRuntime: []bool{true},
 	}
-	newManager(fe).Reconcile(context.Background())
+	newManager(t, fe).Reconcile(context.Background())
 
 	seen := 0
 	for _, c := range calls {
@@ -287,7 +381,7 @@ func TestAptRetriesTransientFailure(t *testing.T) {
 		failContains:  "install -y gnupg",
 		failTimes:     2,
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("apt must survive %d transient failures, got %s (err %v)", fe.failTimes, obs.ObservedState, obs.LastError)
 	}
@@ -300,7 +394,7 @@ func TestAptGivesUpAfterAllTries(t *testing.T) {
 		failContains: "install -y gnupg",
 		failTimes:    3,
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupError {
 		t.Fatalf("failures beyond the retry budget → error, got %s", obs.ObservedState)
 	}
@@ -318,7 +412,7 @@ func TestReconcileStockImageNeedsNoApt(t *testing.T) {
 		aptConfPresent: true,
 		nvidiaRuntime:  []bool{true},
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("stock image → ready, got %s (err %v)", obs.ObservedState, obs.LastError)
 	}
@@ -344,7 +438,7 @@ func TestReconcileFallsBackToUnzipWithoutPython(t *testing.T) {
 		nvidiaRuntime:  []bool{true},
 		failContains:   "zipfile",
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("missing python3 → still ready via unzip, got %s (err %v)", obs.ObservedState, obs.LastError)
 	}
@@ -366,7 +460,7 @@ func TestReconcileInstallsFuseOnlyWhenMissing(t *testing.T) {
 		aptConfPresent: true,
 		nvidiaRuntime:  []bool{true},
 	}
-	obs := newManager(fe).Reconcile(context.Background())
+	obs := newManager(t, fe).Reconcile(context.Background())
 	if obs.ObservedState != client.SetupReady {
 		t.Fatalf("expected ready, got %s (err %v)", obs.ObservedState, obs.LastError)
 	}
@@ -386,7 +480,7 @@ func TestReconcileWritesAptLockConfigOnceWhenMissing(t *testing.T) {
 		fuseOK:         true,
 		aptConfPresent: false,
 	}
-	newManager(fe).Reconcile(context.Background())
+	newManager(t, fe).Reconcile(context.Background())
 
 	writes := 0
 	for _, c := range calls {
@@ -410,7 +504,7 @@ func TestReconcileKeepsExistingAptLockConfig(t *testing.T) {
 		fuseOK:         true,
 		aptConfPresent: true,
 	}
-	newManager(fe).Reconcile(context.Background())
+	newManager(t, fe).Reconcile(context.Background())
 
 	if strings.Contains(joined(calls), "printf") {
 		t.Errorf("existing config must not be rewritten (cloud-init owns it), calls: %s", joined(calls))
@@ -427,7 +521,7 @@ func TestReconcileEmitsPhasesInOrder(t *testing.T) {
 		fuseOK:        false,
 		nvidiaRuntime: []bool{true},
 	}
-	m := newManager(fe)
+	m := newManager(t, fe)
 	m.SetReporter(func(_ context.Context, obs client.AgentSetupObserved) {
 		emits = append(emits, obs.ObservedState)
 	})
@@ -462,7 +556,7 @@ func TestReconcileProgressMonotonic(t *testing.T) {
 		fuseOK:        false,
 		nvidiaRuntime: []bool{true},
 	}
-	m := newManager(fe)
+	m := newManager(t, fe)
 	m.SetReporter(func(_ context.Context, obs client.AgentSetupObserved) {
 		if obs.Progress != nil {
 			progresses = append(progresses, *obs.Progress)
