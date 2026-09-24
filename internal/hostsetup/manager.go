@@ -1,14 +1,10 @@
 package hostsetup
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,11 +24,6 @@ const (
 	unzipViaPython  = `python3 -c "import zipfile; zipfile.ZipFile('/tmp/rclone.zip').extractall('/tmp')"`
 	maxLastError    = 1024
 	maxLogTail      = 4096
-
-	dockerConfigPath   = "/etc/docker/daemon.json"
-	dockerDownloadsKey = "max-concurrent-downloads"
-	dockerDownloads    = 8
-	dockerRestartTries = 30
 
 	defaultNvidiaTries   = 30
 	defaultAptTries      = 3
@@ -54,7 +45,6 @@ type Manager struct {
 
 	lastOutput   string
 	reachedReady bool
-	dockerConfig string
 
 	pollDelay     time.Duration
 	nvidiaTries   int
@@ -67,7 +57,6 @@ func NewManager(exec system.Executor, systemd system.Systemd, log *slog.Logger) 
 		exec:          exec,
 		systemd:       systemd,
 		log:           log,
-		dockerConfig:  dockerConfigPath,
 		pollDelay:     defaultPollDelay,
 		nvidiaTries:   defaultNvidiaTries,
 		aptTries:      defaultAptTries,
@@ -84,10 +73,6 @@ func (m *Manager) SetWaitsForTest(pollDelay time.Duration, nvidiaTries, aptTries
 	m.nvidiaTries = nvidiaTries
 	m.aptTries = aptTries
 	m.aptRetryDelay = pollDelay
-}
-
-func (m *Manager) SetDockerConfigForTest(path string) {
-	m.dockerConfig = path
 }
 
 func (m *Manager) emit(ctx context.Context, obs client.AgentSetupObserved) {
@@ -139,18 +124,16 @@ func (m *Manager) steps() []step {
 		{
 			phase: client.SetupInstallingDocker,
 			skip: func(ctx context.Context) bool {
-				return m.dockerInfoOK(ctx) && m.dockerTuned()
+				return m.dockerInfoOK(ctx)
 			},
 			run: func(ctx context.Context) error {
-				if !m.dockerInfoOK(ctx) {
-					if err := m.installDocker(ctx); err != nil {
-						return err
-					}
+				if _, err := m.sh(ctx, dockerInstallTO, "curl -fsSL https://get.docker.com | sh"); err != nil {
+					return err
 				}
-				if m.dockerTuned() {
-					return nil
+				if err := m.systemd.Enable(ctx, "docker"); err != nil {
+					return err
 				}
-				return m.tuneDocker(ctx)
+				return m.systemd.Start(ctx, "docker")
 			},
 		},
 		{
@@ -171,84 +154,6 @@ func (m *Manager) steps() []step {
 			run: m.installStorage,
 		},
 	}
-}
-
-func (m *Manager) installDocker(ctx context.Context) error {
-	if _, err := m.sh(ctx, dockerInstallTO, "curl -fsSL https://get.docker.com | sh"); err != nil {
-		return err
-	}
-	if err := m.systemd.Enable(ctx, "docker"); err != nil {
-		return err
-	}
-	return m.systemd.Start(ctx, "docker")
-}
-
-func (m *Manager) readDockerConfig() (map[string]any, error) {
-	cfg := map[string]any{}
-	data, err := os.ReadFile(m.dockerConfig)
-	if errors.Is(err, os.ErrNotExist) {
-		return cfg, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return cfg, nil
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", m.dockerConfig, err)
-	}
-	return cfg, nil
-}
-
-func (m *Manager) dockerTuned() bool {
-	cfg, err := m.readDockerConfig()
-	if err != nil {
-		return false
-	}
-	downloads, _ := cfg[dockerDownloadsKey].(float64)
-	return downloads >= dockerDownloads
-}
-
-func (m *Manager) tuneDocker(ctx context.Context) error {
-	cfg, err := m.readDockerConfig()
-	if err != nil {
-		return err
-	}
-	cfg[dockerDownloadsKey] = dockerDownloads
-	data, err := json.MarshalIndent(cfg, "", "    ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(m.dockerConfig), 0o755); err != nil {
-		return err
-	}
-	tmp := m.dockerConfig + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, m.dockerConfig); err != nil {
-		return err
-	}
-	m.log.Info("docker pull concurrency raised", "max_concurrent_downloads", dockerDownloads)
-
-	if err := m.systemd.Stop(ctx, "docker"); err != nil {
-		return err
-	}
-	if err := m.systemd.Start(ctx, "docker"); err != nil {
-		return err
-	}
-	for i := 0; i < dockerRestartTries; i++ {
-		if m.dockerInfoOK(ctx) {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(m.pollDelay):
-		}
-	}
-	return fmt.Errorf("docker did not come back after %d attempts", dockerRestartTries)
 }
 
 func (m *Manager) configureNvidia(ctx context.Context) error {
