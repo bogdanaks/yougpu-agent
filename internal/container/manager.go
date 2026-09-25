@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 const (
 	AppContainerName = "app_container"
+	StartedMarker    = "app_container_started"
 	labelManaged     = "yougpu.managed"
 	labelSpecHash    = "yougpu.spec.hash"
 	dockerTimeout    = 5 * time.Second
@@ -49,10 +51,24 @@ type Manager struct {
 	reporter func(context.Context, client.AgentContainerObserved)
 	log      *slog.Logger
 	name     string
+	stateDir string
 }
 
-func NewManager(exec system.Executor, puller Puller, log *slog.Logger) *Manager {
-	return &Manager{exec: exec, puller: puller, log: log, name: AppContainerName}
+func NewManager(exec system.Executor, puller Puller, stateDir string, log *slog.Logger) *Manager {
+	return &Manager{exec: exec, puller: puller, log: log, name: AppContainerName, stateDir: stateDir}
+}
+
+func (m *Manager) markStarted() {
+	if m.stateDir == "" {
+		return
+	}
+	marker := filepath.Join(m.stateDir, StartedMarker)
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		m.log.Warn("could not persist container start", "err", err)
+	}
 }
 
 func (m *Manager) SetReporter(fn func(context.Context, client.AgentContainerObserved)) {
@@ -106,6 +122,9 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec
 
 	switch Decide(hasSpec, desiredHash, obs) {
 	case ActionNone:
+		if hasSpec && obs.Running {
+			m.markStarted()
+		}
 		return m.report(hasSpec, desiredHash, obs, nil)
 	case ActionRemove:
 		m.log.Info("removing unmanaged/orphan container", "name", m.name)
@@ -231,6 +250,7 @@ func (m *Manager) apply(ctx context.Context, spec *client.AgentContainerSpec, ha
 	if _, err := m.exec.Run(ctx, runTimeout, "docker", args...); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
+	m.markStarted()
 
 	m.emit(ctx, client.AgentContainerObserved{ObservedState: client.ContainerRunning, SpecHash: hash})
 	return nil

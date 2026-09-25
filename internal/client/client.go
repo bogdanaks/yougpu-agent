@@ -16,10 +16,9 @@ import (
 )
 
 const (
-	tokenHeader      = "x-provisioning-token"
-	defaultTimeout   = 30 * time.Second
-	maxResponseBytes = 1 << 20
-	// На 429 ждём Retry-After (с cap'ом против мусора в header'е) и делаем один retry.
+	tokenHeader           = "x-provisioning-token"
+	defaultTimeout        = 30 * time.Second
+	maxResponseBytes      = 1 << 20
 	rateLimitMaxWait      = 60 * time.Second
 	rateLimitFallbackWait = 5 * time.Second
 )
@@ -42,10 +41,6 @@ func New(baseURL, token, version string, log *slog.Logger) *Client {
 	}
 }
 
-// StreamSpec открывает SSE-стрим и шлёт каждое spec-событие в out-канал. Возвращается
-// когда соединение закрылось / контекст отменён / backend ответил терминальной ошибкой.
-// На 410/401 возвращается HTTPError — caller должен self-stop. На сетевые ошибки —
-// caller реконнектит с backoff'ом.
 func (c *Client) StreamSpec(ctx context.Context, out chan<- *AgentSpec) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/spec/stream", nil)
 	if err != nil {
@@ -54,7 +49,6 @@ func (c *Client) StreamSpec(ctx context.Context, out chan<- *AgentSpec) error {
 	req.Header.Set(tokenHeader, c.token)
 	req.Header.Set("Accept", "text/event-stream")
 
-	// Stream-клиент без global timeout — соединение долгоживущее.
 	streamHTTP := &http.Client{Timeout: 0}
 	resp, err := streamHTTP.Do(req)
 	if err != nil {
@@ -97,7 +91,6 @@ func (c *Client) StreamSpec(ctx context.Context, out chan<- *AgentSpec) error {
 		case strings.HasPrefix(line, "data:"):
 			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		case strings.HasPrefix(line, ":"):
-			// SSE comment — игнорируем (heartbeat / keep-alive).
 		}
 	}
 	return scanner.Err()
@@ -119,8 +112,6 @@ func (c *Client) PostStatus(ctx context.Context, status *AgentStatus) error {
 	return nil
 }
 
-// Heartbeat — lightweight pulse: только last_status_at + сбрасывает agent_unresponsive_since.
-// Bcakend возвращает 410 на терминальных инстансах.
 func (c *Client) Heartbeat(ctx context.Context) error {
 	if err := c.do(ctx, http.MethodPut, "/heartbeat", nil, nil); err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
@@ -129,7 +120,6 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	return nil
 }
 
-// IsGone проверяет, что backend ответил 410 (инстанс терминальный) — агент должен self-stop.
 func IsGone(err error) bool {
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
@@ -163,8 +153,6 @@ func (c *Client) ReportProvisioningStatus(ctx context.Context, req *Provisioning
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
-	// buf нужен отдельно от reader'а: bytes.NewReader исчерпывается после первого Read,
-	// а на 429-retry нужно отправить тело ещё раз.
 	var buf []byte
 	if body != nil {
 		var err error
@@ -241,7 +229,6 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	return json.Unmarshal(env.Data, out)
 }
 
-// RFC 7231: число секунд ИЛИ HTTP-date. Пустой/битый header → fallback, > cap → cap.
 func parseRetryAfter(h string) time.Duration {
 	if h == "" {
 		return rateLimitFallbackWait

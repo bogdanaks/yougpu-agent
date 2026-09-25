@@ -3,6 +3,9 @@ package state
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,14 +43,18 @@ func exists(root, rel string) bool {
 	return err == nil
 }
 
+var roomy = Limits{Bytes: 1 << 30, Entries: 1000}
+
+var hostileInclude = []string{"user", "comfyui.db", "a", "b", "ok", "dev", "hard"}
+
 func roundTrip(t *testing.T, src string) string {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := Pack(src, testInclude, testExclude, &buf); err != nil {
+	if err := Pack(src, testInclude, testExclude, &buf, roomy); err != nil {
 		t.Fatalf("pack: %v", err)
 	}
 	dst := t.TempDir()
-	if err := Unpack(&buf, dst, 1<<30); err != nil {
+	if err := Unpack(&buf, dst, testInclude, roomy); err != nil {
 		t.Fatalf("unpack: %v", err)
 	}
 	return dst
@@ -139,7 +146,7 @@ func TestUnpackRejectsPathsOutsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"../escaped", "/etc/escaped", "user/../../escaped"} {
-		if err := Unpack(hostile(t, regular(name, 1)), root, 1<<20); err == nil {
+		if err := Unpack(hostile(t, regular(name, 1)), root, []string{"user", "escaped", "etc"}, roomy); err == nil {
 			t.Errorf("%s unpacked", name)
 		}
 	}
@@ -152,7 +159,7 @@ func TestUnpackDoesNotFollowSymlinks(t *testing.T) {
 	outside := t.TempDir()
 	root := t.TempDir()
 	archive := hostile(t, &tar.Header{Typeflag: tar.TypeSymlink, Name: "user", Linkname: outside}, regular("user/planted", 1))
-	if err := Unpack(archive, root, 1<<20); err == nil {
+	if err := Unpack(archive, root, hostileInclude, roomy); err == nil {
 		t.Error("wrote through a symlink")
 	}
 	if exists(outside, "planted") {
@@ -163,7 +170,7 @@ func TestUnpackDoesNotFollowSymlinks(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "victim"), filepath.Join(root, "comfyui.db")); err != nil {
 		t.Fatal(err)
 	}
-	if err := Unpack(hostile(t, regular("comfyui.db", 3)), root, 1<<20); err != nil {
+	if err := Unpack(hostile(t, regular("comfyui.db", 3)), root, hostileInclude, roomy); err != nil {
 		t.Fatal(err)
 	}
 	if readFile(t, outside, "victim") != "original" {
@@ -172,7 +179,7 @@ func TestUnpackDoesNotFollowSymlinks(t *testing.T) {
 }
 
 func TestUnpackStopsAtLimitAndSkipsSpecialFiles(t *testing.T) {
-	if err := Unpack(hostile(t, regular("a", 10), regular("b", 10)), t.TempDir(), 15); err == nil {
+	if err := Unpack(hostile(t, regular("a", 10), regular("b", 10)), t.TempDir(), hostileInclude, Limits{Bytes: 15, Entries: 10}); err == nil {
 		t.Error("limit not enforced")
 	}
 	root := t.TempDir()
@@ -181,10 +188,107 @@ func TestUnpackStopsAtLimitAndSkipsSpecialFiles(t *testing.T) {
 		&tar.Header{Typeflag: tar.TypeLink, Name: "hard", Linkname: "/etc/passwd"},
 		regular("ok", 2),
 	)
-	if err := Unpack(archive, root, 1<<20); err != nil {
+	if err := Unpack(archive, root, hostileInclude, roomy); err != nil {
 		t.Fatal(err)
 	}
 	if exists(root, "dev") || exists(root, "hard") || !exists(root, "ok") {
 		t.Fatal("special files handled wrong")
 	}
+}
+
+func TestPackStopsAboveUnpackedLimit(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, src, "user/a", strings.Repeat("x", 600), 0o644)
+	writeFile(t, src, "user/b", strings.Repeat("x", 600), 0o644)
+
+	err := Pack(src, testInclude, testExclude, io.Discard, Limits{Bytes: 1000, Entries: 100})
+
+	if !errors.Is(err, errTooLarge) {
+		t.Fatalf("want errTooLarge, got %v", err)
+	}
+}
+
+func TestPackStopsAboveEntryLimit(t *testing.T) {
+	src := t.TempDir()
+	for i := range 5 {
+		writeFile(t, src, fmt.Sprintf("user/f%d", i), "", 0o644)
+	}
+
+	err := Pack(src, testInclude, testExclude, io.Discard, Limits{Bytes: 1 << 20, Entries: 4})
+
+	if !errors.Is(err, errTooLarge) {
+		t.Fatalf("want errTooLarge, got %v", err)
+	}
+}
+
+func TestUnpackStopsAtEntryLimit(t *testing.T) {
+	var entries []*tar.Header
+	for i := range 5 {
+		entries = append(entries, regular(fmt.Sprintf("a%d", i), 0))
+	}
+	err := Unpack(hostile(t, entries...), t.TempDir(), []string{"a0", "a1", "a2", "a3", "a4"}, Limits{Bytes: 1 << 20, Entries: 4})
+	if !errors.Is(err, errTooLarge) {
+		t.Fatalf("want errTooLarge, got %v", err)
+	}
+}
+
+func TestUnpackWritesOnlyIncludedEntries(t *testing.T) {
+	root := t.TempDir()
+	archive := hostile(t,
+		regular("user/tabs.json", 2),
+		regular("userland/x", 2),
+		regular("models/checkpoints/planted.safetensors", 2),
+		&tar.Header{Typeflag: tar.TypeDir, Name: "output/", Mode: 0o755},
+	)
+
+	if err := Unpack(archive, root, []string{"user", "custom_nodes"}, roomy); err != nil {
+		t.Fatal(err)
+	}
+
+	if !exists(root, "user/tabs.json") {
+		t.Fatal("included entry lost")
+	}
+	for _, rel := range []string{"userland", "models", "output"} {
+		if exists(root, rel) {
+			t.Errorf("%s written although it is not in include", rel)
+		}
+	}
+}
+
+func TestUnpackRejectsHugeWindow(t *testing.T) {
+	var buf bytes.Buffer
+	enc, err := zstd.NewWriter(&buf, zstd.WithWindowSize(64<<20), zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(enc)
+	body := randomBytes(1 << 20)
+	if err := tw.WriteHeader(regular("user/big", int64(len(body)))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Unpack(&buf, t.TempDir(), testInclude, roomy); err == nil {
+		t.Fatal("archive with a 64 MB window accepted")
+	}
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	x := uint32(2463534242)
+	for i := range b {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		b[i] = byte(x)
+	}
+	return b
 }

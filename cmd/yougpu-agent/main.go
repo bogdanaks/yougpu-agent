@@ -75,7 +75,7 @@ func main() {
 		diskMgr.SetDirectMode(true)
 		logger.Info("disk driver: direct (rclone --daemon, без systemd)")
 	}
-	containerMgr := container.NewManager(executor, container.NewSocketPuller(), logger)
+	containerMgr := container.NewManager(executor, container.NewSocketPuller(), cfg.StateDir, logger)
 	firewallMgr := firewall.NewManager(executor, logger)
 	tunnelMgr := tunnel.NewManager(logger)
 	hostSetupMgr := hostsetup.NewManager(executor, systemd, logger)

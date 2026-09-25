@@ -18,11 +18,48 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 )
 
 func newTestManager() *Manager { return New(slog.New(slog.NewTextHandler(io.Discard, nil))) }
+
+func (m *Manager) wait() {
+	m.mu.Lock()
+	done := m.done
+	m.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+func finishes(mgr *Manager, within time.Duration) bool {
+	finished := make(chan struct{})
+	go func() {
+		mgr.wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
+func settle(t *testing.T, mgr *Manager, spec *client.AgentContentSpec, container *client.AgentContainerSpec) client.AgentContentObserved {
+	t.Helper()
+	mgr.Reconcile(context.Background(), spec, container)
+	if !finishes(mgr, 10*time.Second) {
+		t.Fatal("content pass did not finish")
+	}
+	obs, settled := mgr.Observe()
+	if !settled {
+		t.Fatalf("content pass finished but is not settled: %+v", obs)
+	}
+	return obs
+}
 
 func containerWith(root string) *client.AgentContainerSpec {
 	return &client.AgentContainerSpec{
@@ -59,7 +96,7 @@ func TestReconcileInlineFileAndModelDownload(t *testing.T) {
 		},
 	}
 
-	obs := newTestManager().Reconcile(context.Background(), spec, containerWith(root))
+	obs := settle(t, newTestManager(), spec, containerWith(root))
 	if obs.ObservedState != client.ContentReady {
 		t.Fatalf("want ready, got %s (err=%v)", obs.ObservedState, obs.LastError)
 	}
@@ -89,10 +126,10 @@ func TestReconcileDedupSkipsPresent(t *testing.T) {
 		Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin", SHA256: hex.EncodeToString(sum[:])}},
 	}
 	mgr := newTestManager()
-	if obs := mgr.Reconcile(context.Background(), spec, containerWith(root)); obs.ObservedState != client.ContentReady {
+	if obs := settle(t, mgr, spec, containerWith(root)); obs.ObservedState != client.ContentReady {
 		t.Fatalf("first pass not ready: %s", obs.ObservedState)
 	}
-	if obs := mgr.Reconcile(context.Background(), spec, containerWith(root)); obs.ObservedState != client.ContentReady {
+	if obs := settle(t, mgr, spec, containerWith(root)); obs.ObservedState != client.ContentReady {
 		t.Fatalf("second pass not ready: %s", obs.ObservedState)
 	}
 	if hits != 1 {
@@ -119,7 +156,7 @@ func TestReconcileReplacesZeroSizePlaceholder(t *testing.T) {
 	spec := &client.AgentContentSpec{
 		Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}},
 	}
-	if obs := newTestManager().Reconcile(context.Background(), spec, containerWith(root)); obs.ObservedState != client.ContentReady {
+	if obs := settle(t, newTestManager(), spec, containerWith(root)); obs.ObservedState != client.ContentReady {
 		t.Fatalf("not ready: %s", obs.ObservedState)
 	}
 
@@ -148,7 +185,7 @@ func TestReconcileGatedModelReportsUnauthorized(t *testing.T) {
 	spec := &client.AgentContentSpec{
 		Models: []client.ContentModel{{URL: srv.URL + "/flux.safetensors", Type: "diffusion_models", Name: "flux.safetensors"}},
 	}
-	obs := newTestManager().Reconcile(context.Background(), spec, containerWith(root))
+	obs := settle(t, newTestManager(), spec, containerWith(root))
 
 	if obs.ObservedState != client.ContentError {
 		t.Fatalf("want error, got %s", obs.ObservedState)
@@ -187,7 +224,7 @@ func TestReconcileGatedModelDoesNotBlockOthers(t *testing.T) {
 			{URL: srv.URL + "/gone.safetensors", Type: "vae", Name: "gone.safetensors"},
 		},
 	}
-	obs := newTestManager().Reconcile(context.Background(), spec, containerWith(root))
+	obs := settle(t, newTestManager(), spec, containerWith(root))
 
 	if obs.ObservedState != client.ContentError {
 		t.Fatalf("want error, got %s", obs.ObservedState)
@@ -212,7 +249,7 @@ func TestReconcileGatedModelPlacedByUser(t *testing.T) {
 		Models: []client.ContentModel{{URL: srv.URL + "/flux.safetensors", Type: "diffusion_models", Name: "flux.safetensors"}},
 	}
 	m := newTestManager()
-	if obs := m.Reconcile(context.Background(), spec, containerWith(root)); obs.ObservedState != client.ContentError {
+	if obs := settle(t, m, spec, containerWith(root)); obs.ObservedState != client.ContentError {
 		t.Fatalf("first pass: want error, got %s", obs.ObservedState)
 	}
 
@@ -222,7 +259,7 @@ func TestReconcileGatedModelPlacedByUser(t *testing.T) {
 	}
 	before := hits.Load()
 
-	if obs := m.Reconcile(context.Background(), spec, containerWith(root)); obs.ObservedState != client.ContentReady {
+	if obs := settle(t, m, spec, containerWith(root)); obs.ObservedState != client.ContentReady {
 		t.Fatalf("after the user placed the file: want ready, got %s (%v)", obs.ObservedState, obs.LastError)
 	}
 	if extra := hits.Load() - before; extra != 0 {
@@ -240,7 +277,7 @@ func TestReconcileSHA256Mismatch(t *testing.T) {
 	spec := &client.AgentContentSpec{
 		Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin", SHA256: "deadbeef"}},
 	}
-	obs := newTestManager().Reconcile(context.Background(), spec, containerWith(root))
+	obs := settle(t, newTestManager(), spec, containerWith(root))
 	if obs.ObservedState != client.ContentError {
 		t.Fatalf("want error on sha mismatch, got %s", obs.ObservedState)
 	}
@@ -282,7 +319,7 @@ func TestFetchRangedSplitsIntoEightParts(t *testing.T) {
 
 	mgr := newTestManager()
 	mgr.SetRangeMinForTest(1024)
-	obs := mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(root))
+	obs := settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(root))
 	if obs.ObservedState != client.ContentReady {
 		t.Fatalf("want ready, got %s (err=%v)", obs.ObservedState, obs.LastError)
 	}
@@ -316,7 +353,7 @@ func TestFetchFallsBackWithoutRangeSupport(t *testing.T) {
 
 	mgr := newTestManager()
 	mgr.SetRangeMinForTest(1024)
-	obs := mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(root))
+	obs := settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(root))
 	if obs.ObservedState != client.ContentReady {
 		t.Fatalf("want ready, got %s (err=%v)", obs.ObservedState, obs.LastError)
 	}
@@ -344,7 +381,7 @@ func TestFetchRejectsTruncatedRangeResponse(t *testing.T) {
 
 	mgr := newTestManager()
 	mgr.SetRangeMinForTest(1 << 20)
-	obs := mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(root))
+	obs := settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(root))
 	if obs.ObservedState != client.ContentError {
 		t.Fatalf("truncated range response must fail, got %s", obs.ObservedState)
 	}
@@ -389,7 +426,7 @@ func TestFetchRangedResumesBrokenPart(t *testing.T) {
 
 	mgr := newTestManager()
 	mgr.SetRangeMinForTest(1024)
-	obs := mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(root))
+	obs := settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(root))
 	if obs.ObservedState != client.ContentReady {
 		t.Fatalf("want ready after resume, got %s (err=%v)", obs.ObservedState, obs.LastError)
 	}
@@ -402,7 +439,7 @@ func TestFetchRangedResumesBrokenPart(t *testing.T) {
 
 func TestReconcileNoWorkspaceVolume(t *testing.T) {
 	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: "http://x/m", Type: "vae", Name: "m"}}}
-	obs := newTestManager().Reconcile(context.Background(), spec, &client.AgentContainerSpec{})
+	obs := settle(t, newTestManager(), spec, &client.AgentContainerSpec{})
 	if obs.ObservedState != client.ContentError {
 		t.Fatalf("want error without /workspace volume, got %s", obs.ObservedState)
 	}
@@ -417,15 +454,12 @@ func silent(r *http.Request, release <-chan struct{}) {
 
 func reconcileWithin(t *testing.T, mgr *Manager, spec *client.AgentContentSpec, container *client.AgentContainerSpec) client.AgentContentObserved {
 	t.Helper()
-	done := make(chan client.AgentContentObserved, 1)
-	go func() { done <- mgr.Reconcile(context.Background(), spec, container) }()
-	select {
-	case obs := <-done:
-		return obs
-	case <-time.After(5 * time.Second):
+	mgr.Reconcile(context.Background(), spec, container)
+	if !finishes(mgr, 5*time.Second) {
 		t.Fatal("reconcile hung on a silent connection")
-		return client.AgentContentObserved{}
 	}
+	obs, _ := mgr.Observe()
+	return obs
 }
 
 func TestFetchRangedRetriesSilentPart(t *testing.T) {
@@ -561,7 +595,7 @@ func TestReconcileReportsOutcomeOfDownloads(t *testing.T) {
 		reports := &recordedReports{}
 		mgr := newTestManager()
 		mgr.SetReporter(reports.record)
-		obs := mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(t.TempDir()))
+		obs := settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(t.TempDir()))
 		if obs.ObservedState != client.ContentReady {
 			t.Fatalf("want ready, got %s (err=%v)", obs.ObservedState, obs.LastError)
 		}
@@ -574,7 +608,7 @@ func TestReconcileReportsOutcomeOfDownloads(t *testing.T) {
 		reports := &recordedReports{}
 		mgr := newTestManager()
 		mgr.SetReporter(reports.record)
-		mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/missing", body), containerWith(t.TempDir()))
+		settle(t, mgr, modelSpec(srv.URL+"/missing", body), containerWith(t.TempDir()))
 		if got := reports.last(); got.ObservedState != client.ContentError {
 			t.Errorf("last report must be error, got %s", got.ObservedState)
 		}
@@ -585,11 +619,479 @@ func TestReconcileReportsOutcomeOfDownloads(t *testing.T) {
 		mgr := newTestManager()
 		mgr.SetReporter(reports.record)
 		root := t.TempDir()
-		mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(root))
+		settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(root))
 		reports.list = nil
-		mgr.Reconcile(context.Background(), modelSpec(srv.URL+"/m", body), containerWith(root))
+		settle(t, mgr, modelSpec(srv.URL+"/m", body), containerWith(root))
 		if len(reports.list) != 0 {
 			t.Errorf("reconcile with everything in place must not report, got %d reports", len(reports.list))
 		}
 	})
+}
+
+func TestModelNameOutsideRootRejected(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "a", "b", "c", "ws")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("evil"))
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{
+		{URL: srv.URL + "/e", Type: "vae", Name: "../../../../../evil.bin"},
+		{URL: srv.URL + "/e", Type: "../../../..", Name: "evil2.bin"},
+	}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentError {
+		t.Fatalf("want error, got %s", obs.ObservedState)
+	}
+	for _, p := range []string{filepath.Join(parent, "evil.bin"), filepath.Join(parent, "a", "evil.bin"), filepath.Join(parent, "a", "evil2.bin"), filepath.Join(parent, "evil2.bin")} {
+		if _, err := os.Stat(p); err == nil {
+			t.Fatalf("written outside the workspace: %s", p)
+		}
+	}
+}
+
+func TestFetchErrorsDoNotLeakURLSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	mgr := New(slog.New(slog.NewTextHandler(&logs, nil)))
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{
+		{URL: "http://127.0.0.1:1/m.safetensors?token=SECRET123", Type: "vae", Name: "m.safetensors"},
+	}}
+
+	obs := settle(t, mgr, spec, containerWith(t.TempDir()))
+
+	if obs.LastError == nil || strings.Contains(*obs.LastError, "SECRET123") {
+		t.Fatalf("error leaks the token: %v", obs.LastError)
+	}
+	if strings.Contains(logs.String(), "SECRET123") {
+		t.Fatalf("log leaks the token: %s", logs.String())
+	}
+}
+
+func TestModelWithoutSHAChecksSize(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("short"))
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin", SizeBytes: 1000}}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentError {
+		t.Fatalf("want error on size mismatch, got %s", obs.ObservedState)
+	}
+	if _, err := os.Stat(filepath.Join(root, "models/vae/m.bin")); !os.IsNotExist(err) {
+		t.Fatal("file of the wrong size must not be kept")
+	}
+}
+
+func TestHTMLPageInsteadOfModelRejected(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html>login</html>"))
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentError {
+		t.Fatalf("want error for an html page, got %s", obs.ObservedState)
+	}
+	if _, err := os.Stat(filepath.Join(root, "models/vae/m.bin")); !os.IsNotExist(err) {
+		t.Fatal("html page must not be kept as a model")
+	}
+}
+
+func TestConflictingSHAForOneTargetIsAnError(t *testing.T) {
+	root := t.TempDir()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("weights"))
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{
+		{URL: srv.URL + "/a", Type: "vae", Name: "m.bin", SHA256: strings.Repeat("a", 64)},
+		{URL: srv.URL + "/b", Type: "vae", Name: "m.bin", SHA256: strings.Repeat("b", 64)},
+	}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentError || obs.LastError == nil || !strings.Contains(*obs.LastError, "sha256") {
+		t.Fatalf("want a conflict error, got %s %v", obs.ObservedState, obs.LastError)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("conflicting model must not be downloaded, hits=%d", hits.Load())
+	}
+}
+
+func TestDuplicateModelDownloadedOnce(t *testing.T) {
+	root := t.TempDir()
+	body := []byte("weights")
+	sum := sha256.Sum256(body)
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{
+		{URL: srv.URL + "/a", Type: "vae", Name: "m.bin"},
+		{URL: srv.URL + "/a", Type: "vae", Name: "m.bin", SHA256: hex.EncodeToString(sum[:])},
+	}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentReady || hits.Load() != 1 {
+		t.Fatalf("want one download, got %s hits=%d", obs.ObservedState, hits.Load())
+	}
+}
+
+func TestVerifiedModelIsNotHashedAgain(t *testing.T) {
+	root := t.TempDir()
+	body := []byte("weights-one")
+	sum := sha256.Sum256(body)
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin", SHA256: hex.EncodeToString(sum[:])}}}
+	mgr := newTestManager()
+	if obs := settle(t, mgr, spec, containerWith(root)); obs.ObservedState != client.ContentReady {
+		t.Fatalf("first pass: %s", obs.ObservedState)
+	}
+	target := filepath.Join(root, "models/vae/m.bin")
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("weights-two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(target, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	if obs := settle(t, mgr, spec, containerWith(root)); obs.ObservedState != client.ContentReady {
+		t.Fatalf("second pass: %s", obs.ObservedState)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("unchanged file (same size and mtime) must not be hashed and fetched again, hits=%d", hits.Load())
+	}
+}
+
+func TestFailedModelIsRetriedThreeTimesThenGivenUp(t *testing.T) {
+	root := t.TempDir()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+	mgr := newTestManager()
+	mgr.retryBase = 0
+
+	for range 5 {
+		obs := settle(t, mgr, spec, containerWith(root))
+		if obs.ObservedState != client.ContentError || obs.LastError == nil || *obs.LastError != "m.bin: http 502" {
+			t.Fatalf("want the remembered error, got %s %v", obs.ObservedState, obs.LastError)
+		}
+	}
+	if hits.Load() != 3 {
+		t.Fatalf("want 3 attempts, got %d", hits.Load())
+	}
+
+	spec.Models[0].URL = srv.URL + "/other"
+	settle(t, mgr, spec, containerWith(root))
+	if hits.Load() != 4 {
+		t.Fatalf("a new spec must start over, got %d attempts", hits.Load())
+	}
+}
+
+func TestFailedModelWaitsForBackoff(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+	root := t.TempDir()
+	mgr := newTestManager()
+	mgr.retryBase = time.Hour
+
+	settle(t, mgr, spec, containerWith(root))
+	obs := settle(t, mgr, spec, containerWith(root))
+
+	if hits.Load() != 1 || obs.ObservedState != client.ContentError {
+		t.Fatalf("retry must wait for the backoff, hits=%d state=%s", hits.Load(), obs.ObservedState)
+	}
+}
+
+func TestSHAMismatchIsNotRetried(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("actual"))
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin", SHA256: strings.Repeat("0", 64)}}}
+	root := t.TempDir()
+	mgr := newTestManager()
+	mgr.retryBase = 0
+
+	settle(t, mgr, spec, containerWith(root))
+	obs := settle(t, mgr, spec, containerWith(root))
+
+	if hits.Load() != 1 || obs.LastError == nil || !strings.Contains(*obs.LastError, "sha256 mismatch") {
+		t.Fatalf("sha mismatch must not be retried, hits=%d err=%v", hits.Load(), obs.LastError)
+	}
+}
+
+func TestModelLargerThanFreeSpaceIsNotDownloaded(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", strconv.FormatInt(1<<60, 10))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+	root := t.TempDir()
+	mgr := newTestManager()
+	mgr.retryBase = 0
+
+	obs := settle(t, mgr, spec, containerWith(root))
+	settle(t, mgr, spec, containerWith(root))
+
+	if obs.LastError == nil || !strings.Contains(*obs.LastError, "not enough disk space") {
+		t.Fatalf("want a disk space error, got %v", obs.LastError)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("no space must not be retried, hits=%d", hits.Load())
+	}
+	entries, _ := os.ReadDir(filepath.Join(root, "models", "vae"))
+	if len(entries) != 0 {
+		t.Fatalf("nothing must be left behind, got %v", entries)
+	}
+}
+
+func TestReconcileReturnsWhileDownloadRunsAndStopCancelsIt(t *testing.T) {
+	started := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("x"))
+		w.(http.Flusher).Flush()
+		once.Do(func() { close(started) })
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	reports := &recordedReports{}
+	mgr := newTestManager()
+	mgr.SetReporter(reports.record)
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+
+	returned := make(chan struct{})
+	go func() {
+		mgr.Reconcile(context.Background(), spec, containerWith(t.TempDir()))
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reconcile must not wait for the download")
+	}
+	<-started
+	if obs, settled := mgr.Observe(); settled || obs.ObservedState != client.ContentDownloading {
+		t.Fatalf("want downloading while the file is on its way, got %s settled=%v", obs.ObservedState, settled)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		mgr.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop must cancel the download")
+	}
+	if got := reports.last(); got.ObservedState == client.ContentError {
+		t.Fatalf("cancelled download must not be reported as an error: %v", got.LastError)
+	}
+}
+
+func TestNotifyAfterFirstPassAndDownloadsOnly(t *testing.T) {
+	body := []byte("weights")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	var notified atomic.Int64
+	mgr := newTestManager()
+	mgr.SetNotify(func() { notified.Add(1) })
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+
+	settle(t, mgr, spec, containerWith(root))
+	settle(t, mgr, spec, containerWith(root))
+	settle(t, mgr, spec, containerWith(root))
+
+	if notified.Load() != 1 {
+		t.Fatalf("idle re-checks must not wake the agent, notified %d times", notified.Load())
+	}
+}
+
+func TestDetailIsClippedForTheBackend(t *testing.T) {
+	body := []byte("weights")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	long := strings.Repeat("я", 120) + "/" + strings.Repeat("д", 120) + "/" + strings.Repeat("😀", 50) + ".bin"
+	reports := &recordedReports{}
+	mgr := newTestManager()
+	mgr.SetReporter(reports.record)
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "loras", Name: long}}}
+
+	obs := settle(t, mgr, spec, containerWith(t.TempDir()))
+
+	if obs.ObservedState != client.ContentReady {
+		t.Fatalf("want ready, got %s %v", obs.ObservedState, obs.LastError)
+	}
+	reports.mu.Lock()
+	defer reports.mu.Unlock()
+	for _, r := range reports.list {
+		if r.Detail != nil && len(utf16.Encode([]rune(*r.Detail))) > 255 {
+			t.Fatalf("detail is %d UTF-16 units", len(utf16.Encode([]rune(*r.Detail))))
+		}
+	}
+}
+
+func TestClipKeepsWholeRunes(t *testing.T) {
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"abc", 5, "abc"},
+		{"абв", 2, "аб"},
+		{"a😀b", 2, "a"},
+		{"a😀b", 3, "a😀"},
+	}
+	for _, c := range cases {
+		if got := Clip(c.in, c.n); got != c.want {
+			t.Errorf("Clip(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
+		}
+	}
+}
+
+func TestRangedPartsUseTheRedirectTarget(t *testing.T) {
+	body := randomBody(1 << 20)
+	var mu sync.Mutex
+	var starts, finals int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/start" {
+			starts++
+			http.Redirect(w, r, "/final?sig=1", http.StatusFound)
+			return
+		}
+		finals++
+		http.ServeContent(w, r, "m.bin", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+	mgr := newTestManager()
+	mgr.SetRangeMinForTest(1024)
+	root := t.TempDir()
+
+	obs := settle(t, mgr, modelSpec(srv.URL+"/start?token=x", body), containerWith(root))
+
+	if obs.ObservedState != client.ContentReady {
+		t.Fatalf("want ready, got %s %v", obs.ObservedState, obs.LastError)
+	}
+	if starts != 1 || finals != 9 {
+		t.Fatalf("parts must go straight to the redirect target: start=%d final=%d", starts, finals)
+	}
+}
+
+func TestModelFolderSymlinkedOutsideIsNotFollowed(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "models"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "models", "vae")); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("evil"))
+	}))
+	defer srv.Close()
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentError {
+		t.Fatalf("want error, got %s", obs.ObservedState)
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 0 {
+		t.Fatalf("written through a symlink outside the workspace: %v", entries)
+	}
+}
+
+func TestModelNameValidation(t *testing.T) {
+	good := []string{"m.safetensors", "sub/m.safetensors", "a/b/c.bin", strings.Repeat("x", 255)}
+	bad := []string{"", "/abs.bin", "../m.bin", "a/../m.bin", "a//m.bin", "./m.bin", "a\\m.bin", "m\n.bin", "m\x7f.bin", strings.Repeat("x", 256), "a/"}
+	for _, name := range good {
+		if err := checkModel("checkpoints", name); err != nil {
+			t.Errorf("%q rejected: %v", name, err)
+		}
+	}
+	for _, name := range bad {
+		if err := checkModel("checkpoints", name); err == nil {
+			t.Errorf("%q accepted", name)
+		}
+	}
+	if err := checkModel("loras/sdxl", "m.bin"); err != nil {
+		t.Errorf("nested folder rejected: %v", err)
+	}
+	for _, folder := range []string{"", "..", "../x", "/etc", "a/../..", "a\\b"} {
+		if err := checkModel(folder, "m.bin"); err == nil {
+			t.Errorf("folder %q accepted", folder)
+		}
+	}
+}
+
+func TestEmptyModelIsAnError(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	mgr := newTestManager()
+	mgr.retryBase = time.Hour
+	spec := &client.AgentContentSpec{Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}}}
+
+	obs := settle(t, mgr, spec, containerWith(root))
+	settle(t, mgr, spec, containerWith(root))
+
+	if obs.ObservedState != client.ContentError || hits.Load() != 1 {
+		t.Fatalf("empty model must fail and wait for the backoff, got %s hits=%d", obs.ObservedState, hits.Load())
+	}
 }

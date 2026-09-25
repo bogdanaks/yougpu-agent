@@ -119,19 +119,16 @@ const (
 )
 
 type AgentStatus struct {
-	ObservedGeneration int64           `json:"observed_generation"`
-	Lifecycle          StatusLifecycle `json:"lifecycle"`
-	// omitempty: nil-slice сериализуется в `null`, что валит Zod-валидацию backend'а
-	// (она ожидает массив или missing — null нелегитимен). Пустой массив тоже устроит,
-	// но omitempty короче и совпадает с DTO-дефолтом backend'а (.default([])).
-	Disks        []AgentDiskObserved     `json:"disks,omitempty"`
-	Container    *AgentContainerObserved `json:"container,omitempty"`
-	Firewall     *AgentFirewallObserved  `json:"firewall,omitempty"`
-	Setup        *AgentSetupObserved     `json:"setup,omitempty"`
-	Content      *AgentContentObserved   `json:"content,omitempty"`
-	State        *AgentStateObserved     `json:"state,omitempty"`
-	AgentVersion string                  `json:"agent_version,omitempty"`
-	UptimeSec    int64                   `json:"uptime_sec,omitempty"`
+	ObservedGeneration int64                   `json:"observed_generation"`
+	Lifecycle          StatusLifecycle         `json:"lifecycle"`
+	Disks              []AgentDiskObserved     `json:"disks,omitempty"`
+	Container          *AgentContainerObserved `json:"container,omitempty"`
+	Firewall           *AgentFirewallObserved  `json:"firewall,omitempty"`
+	Setup              *AgentSetupObserved     `json:"setup,omitempty"`
+	Content            *AgentContentObserved   `json:"content,omitempty"`
+	State              *AgentStateObserved     `json:"state,omitempty"`
+	AgentVersion       string                  `json:"agent_version,omitempty"`
+	UptimeSec          int64                   `json:"uptime_sec,omitempty"`
 }
 
 type StatusLifecycle struct {
@@ -207,16 +204,12 @@ const (
 	StateRestoreFailed = "restore_failed"
 	StateSaving        = "saving"
 	StateSaved         = "saved"
+	StateSaveSkipped   = "save_skipped"
 	StateSaveFailed    = "save_failed"
 
 	ContentDownloading = "downloading"
 	ContentReady       = "ready"
 	ContentError       = "error"
-
-	LifecycleAlive          = "alive"
-	LifecycleSyncing        = "syncing"
-	LifecycleSynced         = "synced"
-	LifecycleDestroyingSelf = "destroying_self"
 )
 
 type StorageCredentials struct {

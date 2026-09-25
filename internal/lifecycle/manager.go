@@ -23,6 +23,8 @@ const (
 	StateDestroyingSelf = "destroying_self"
 
 	dockerStopTimeout = 30 * time.Second
+	dockerKillTimeout = 15 * time.Second
+	dockerListTimeout = 5 * time.Second
 )
 
 type Disker interface {
@@ -32,7 +34,7 @@ type Disker interface {
 
 type Hooks struct {
 	BeforeStop func(context.Context)
-	AfterStop  func(context.Context)
+	AfterStop  func(ctx context.Context, stopErr error) bool
 }
 
 type SystemdStopper interface {
@@ -76,10 +78,6 @@ func (m *Manager) HandleTermination(ctx context.Context, disker Disker, hooks Ho
 	case StateSynced, StateDestroyingSelf:
 		return StateSynced, nil
 	case StateSyncing:
-		if hooks.AfterStop != nil {
-			hooks.AfterStop(ctx)
-		}
-		return m.finishSync(ctx, disker)
 	default:
 		if err := m.SetState(StateSyncing); err != nil {
 			return StateAlive, fmt.Errorf("persist syncing state: %w", err)
@@ -87,14 +85,15 @@ func (m *Manager) HandleTermination(ctx context.Context, disker Disker, hooks Ho
 		if hooks.BeforeStop != nil {
 			hooks.BeforeStop(ctx)
 		}
-		if err := m.stopContainers(ctx); err != nil {
-			m.log.Warn("docker stop returned error (continuing)", "err", err)
-		}
-		if hooks.AfterStop != nil {
-			hooks.AfterStop(ctx)
-		}
-		return m.finishSync(ctx, disker)
 	}
+	stopErr := m.stopContainers(ctx)
+	if stopErr != nil {
+		m.log.Warn("containers did not stop", "err", stopErr)
+	}
+	if hooks.AfterStop != nil && !hooks.AfterStop(ctx, stopErr) {
+		return StateSyncing, nil
+	}
+	return m.finishSync(ctx, disker)
 }
 
 func (m *Manager) finishSync(ctx context.Context, disker Disker) (string, error) {
@@ -139,21 +138,34 @@ func (m *Manager) Poweroff(ctx context.Context) error {
 }
 
 func (m *Manager) stopContainers(ctx context.Context) error {
-	if _, err := m.exec.Run(ctx, 5*time.Second, "sh", "-c", "command -v docker"); err != nil {
+	if _, err := m.exec.Run(ctx, dockerListTimeout, "sh", "-c", "command -v docker"); err != nil {
 		return nil
 	}
-	ids, err := m.exec.Run(ctx, 5*time.Second, "docker", "ps", "-q")
-	if err != nil {
+	ids, err := m.running(ctx)
+	if err != nil || len(ids) == 0 {
 		return err
 	}
-	ids = strings.TrimSpace(ids)
-	if ids == "" {
-		return nil
+	if _, err := m.exec.Run(ctx, dockerStopTimeout+10*time.Second, "docker", append([]string{"stop", "-t", "30"}, ids...)...); err != nil {
+		m.log.Warn("docker stop returned error", "err", err)
 	}
-	args := []string{"stop", "-t", "30"}
-	args = append(args, strings.Fields(ids)...)
-	_, err = m.exec.Run(ctx, dockerStopTimeout+10*time.Second, "docker", args...)
-	return err
+	if ids, err = m.running(ctx); err != nil || len(ids) == 0 {
+		return err
+	}
+	if _, err := m.exec.Run(ctx, dockerKillTimeout, "docker", append([]string{"kill"}, ids...)...); err != nil {
+		m.log.Warn("docker kill returned error", "err", err)
+	}
+	if ids, err = m.running(ctx); err != nil || len(ids) == 0 {
+		return err
+	}
+	return fmt.Errorf("контейнер не остановился: %s", strings.Join(ids, " "))
+}
+
+func (m *Manager) running(ctx context.Context) ([]string, error) {
+	out, err := m.exec.Run(ctx, dockerListTimeout, "docker", "ps", "-q")
+	if err != nil {
+		return nil, fmt.Errorf("docker ps: %w", err)
+	}
+	return strings.Fields(out), nil
 }
 
 func (m *Manager) flushStorageUnits(ctx context.Context, disker Disker) error {

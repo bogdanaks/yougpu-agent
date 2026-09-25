@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -73,7 +75,7 @@ func TestDecide(t *testing.T) {
 }
 
 func TestRunArgsContainsCoreFlags(t *testing.T) {
-	m := NewManager(nil, nil, testLogger())
+	m := NewManager(nil, nil, "", testLogger())
 	args := m.runArgs(sampleSpec(), "deadbeef")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
@@ -89,7 +91,7 @@ func TestRunArgsContainsCoreFlags(t *testing.T) {
 }
 
 func TestRunArgsRunCommandAppended(t *testing.T) {
-	m := NewManager(nil, nil, testLogger())
+	m := NewManager(nil, nil, "", testLogger())
 	spec := sampleSpec()
 	spec.RunCommand = ptrStr("python main.py")
 	args := m.runArgs(spec, "h")
@@ -100,7 +102,7 @@ func TestRunArgsRunCommandAppended(t *testing.T) {
 }
 
 func TestRunArgsNoShmFallsBackToIpcHost(t *testing.T) {
-	m := NewManager(nil, nil, testLogger())
+	m := NewManager(nil, nil, "", testLogger())
 	spec := sampleSpec()
 	spec.ShmSizeGB = nil
 	joined := strings.Join(m.runArgs(spec, "h"), " ")
@@ -151,7 +153,7 @@ func TestReconcileCallsGateBetweenPullAndRun(t *testing.T) {
 	spec.Volumes = nil
 	var order []string
 	puller := &fakePuller{order: &order}
-	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, puller, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, puller, "", testLogger())
 
 	_ = m.Reconcile(context.Background(), spec, func() bool { order = append(order, "gate"); return true })
 
@@ -178,7 +180,7 @@ func TestReconcileDoesNotStartWhenGateCloses(t *testing.T) {
 	spec := sampleSpec()
 	spec.Volumes = nil
 	var order []string
-	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, &fakePuller{order: &order}, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &order}, &fakePuller{order: &order}, "", testLogger())
 
 	obs := m.Reconcile(context.Background(), spec, func() bool { return false })
 
@@ -196,7 +198,7 @@ func TestReconcileSkipsGateWhenNothingToApply(t *testing.T) {
 	spec := sampleSpec()
 	hash := SpecHash(spec)
 	gated := false
-	m := NewManager(scriptExec{t: t, inspect: "true|" + hash}, &fakePuller{}, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "true|" + hash}, &fakePuller{}, "", testLogger())
 
 	_ = m.Reconcile(context.Background(), spec, func() bool { gated = true; return true })
 
@@ -210,7 +212,7 @@ func TestReconcileNoopWhenRunningMatches(t *testing.T) {
 	hash := SpecHash(spec)
 	var calls []string
 	puller := &fakePuller{}
-	m := NewManager(scriptExec{t: t, inspect: "true|" + hash, runCalls: &calls}, puller, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "true|" + hash, runCalls: &calls}, puller, "", testLogger())
 
 	obs := m.Reconcile(context.Background(), spec, nil)
 	if obs.ObservedState != client.ContainerRunning {
@@ -231,7 +233,7 @@ func TestReconcileAppliesWhenAbsent(t *testing.T) {
 	spec.Volumes = nil
 	var calls []string
 	puller := &fakePuller{}
-	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("Error: No such object: app_container"), runCalls: &calls}, puller, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("Error: No such object: app_container"), runCalls: &calls}, puller, "", testLogger())
 
 	_ = m.Reconcile(context.Background(), spec, nil)
 	if len(puller.pulled) != 1 || puller.pulled[0] != "pytorch/pytorch:latest" {
@@ -248,7 +250,7 @@ func TestReconcileEmitsPhases(t *testing.T) {
 	hash := SpecHash(spec)
 	var calls []string
 	puller := &fakePuller{progress: []PullProgress{{Percent: 50, LayersDone: 1, LayersTotal: 2}}}
-	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &calls}, puller, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object"), runCalls: &calls}, puller, "", testLogger())
 
 	var phases []string
 	m.SetReporter(func(_ context.Context, obs client.AgentContainerObserved) {
@@ -280,7 +282,7 @@ func TestReconcileEmitsPhases(t *testing.T) {
 
 func TestReconcileRemovesOrphanWhenNoSpec(t *testing.T) {
 	var calls []string
-	m := NewManager(scriptExec{t: t, inspect: "true|", runCalls: &calls}, nil, testLogger())
+	m := NewManager(scriptExec{t: t, inspect: "true|", runCalls: &calls}, nil, "", testLogger())
 
 	obs := m.Reconcile(context.Background(), nil, nil)
 	if obs.ObservedState != client.ContainerAbsent {
@@ -293,4 +295,55 @@ func TestReconcileRemovesOrphanWhenNoSpec(t *testing.T) {
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestSuccessfulRunLeavesStartedMarker(t *testing.T) {
+	spec := sampleSpec()
+	spec.Volumes = nil
+	dir := t.TempDir()
+	m := NewManager(scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object")}, &fakePuller{}, dir, testLogger())
+
+	m.Reconcile(context.Background(), spec, func() bool { return false })
+	if _, err := os.Stat(filepath.Join(dir, StartedMarker)); err == nil {
+		t.Fatal("marker written although the container never started")
+	}
+
+	m.Reconcile(context.Background(), spec, nil)
+	if _, err := os.Stat(filepath.Join(dir, StartedMarker)); err != nil {
+		t.Fatalf("marker missing after docker run: %v", err)
+	}
+}
+
+func TestRunningContainerLeavesStartedMarker(t *testing.T) {
+	spec := sampleSpec()
+	dir := t.TempDir()
+	m := NewManager(scriptExec{t: t, inspect: "true|" + SpecHash(spec)}, &fakePuller{}, dir, testLogger())
+
+	m.Reconcile(context.Background(), spec, nil)
+
+	if _, err := os.Stat(filepath.Join(dir, StartedMarker)); err != nil {
+		t.Fatalf("marker missing for a running container: %v", err)
+	}
+}
+
+type failingRun struct{ scriptExec }
+
+func (f failingRun) Run(ctx context.Context, d time.Duration, name string, args ...string) (string, error) {
+	if name == "docker" && len(args) > 0 && args[0] == "run" {
+		return "", fmt.Errorf("docker run failed")
+	}
+	return f.scriptExec.Run(ctx, d, name, args...)
+}
+
+func TestFailedRunLeavesNoStartedMarker(t *testing.T) {
+	spec := sampleSpec()
+	spec.Volumes = nil
+	dir := t.TempDir()
+	m := NewManager(failingRun{scriptExec{t: t, inspect: "", inspErr: fmt.Errorf("No such object")}}, &fakePuller{}, dir, testLogger())
+
+	m.Reconcile(context.Background(), spec, nil)
+
+	if _, err := os.Stat(filepath.Join(dir, StartedMarker)); err == nil {
+		t.Fatal("marker written after a failed docker run")
+	}
 }

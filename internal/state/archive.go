@@ -14,6 +14,15 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+const maxWindow = 32 << 20
+
+var errTooLarge = errors.New("state is too large")
+
+type Limits struct {
+	Bytes   int64
+	Entries int
+}
+
 func excluded(patterns []string, rel string) bool {
 	for _, pattern := range patterns {
 		if ok, _ := path.Match(pattern, rel); ok {
@@ -22,12 +31,47 @@ func excluded(patterns []string, rel string) bool {
 	}
 	return false
 }
-func Pack(root string, include, exclude []string, w io.Writer) error {
+
+func included(include []string, rel string) bool {
+	for _, dir := range include {
+		dir = path.Clean(dir)
+		if rel == dir || strings.HasPrefix(rel, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+type counter struct {
+	limits  Limits
+	bytes   int64
+	entries int
+}
+
+func (c *counter) add(size int64) error {
+	c.entries++
+	if c.entries > c.limits.Entries {
+		return fmt.Errorf("%w: more than %d entries", errTooLarge, c.limits.Entries)
+	}
+	c.bytes += size
+	if c.bytes > c.limits.Bytes {
+		return fmt.Errorf("%w: more than %d bytes unpacked", errTooLarge, c.limits.Bytes)
+	}
+	return nil
+}
+
+func Pack(root string, include, exclude []string, w io.Writer, limits Limits) (err error) {
 	enc, err := zstd.NewWriter(w)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil {
+			enc.Close()
+		}
+	}()
 	tw := tar.NewWriter(enc)
+	count := &counter{limits: limits}
 
 	for _, dir := range include {
 		start := filepath.Join(root, filepath.FromSlash(dir))
@@ -49,7 +93,7 @@ func Pack(root string, include, exclude []string, w io.Writer) error {
 				}
 				return nil
 			}
-			return writeEntry(tw, p, rel, d)
+			return writeEntry(tw, p, rel, d, count)
 		})
 		if err != nil {
 			return fmt.Errorf("pack %s: %w", dir, err)
@@ -62,7 +106,7 @@ func Pack(root string, include, exclude []string, w io.Writer) error {
 	return enc.Close()
 }
 
-func writeEntry(tw *tar.Writer, p, rel string, d fs.DirEntry) error {
+func writeEntry(tw *tar.Writer, p, rel string, d fs.DirEntry, count *counter) error {
 	info, err := d.Info()
 	if err != nil {
 		return err
@@ -83,6 +127,9 @@ func writeEntry(tw *tar.Writer, p, rel string, d fs.DirEntry) error {
 	default:
 		return nil
 	}
+	if err := count.add(h.Size); err != nil {
+		return err
+	}
 	if err := tw.WriteHeader(h); err != nil {
 		return err
 	}
@@ -97,15 +144,16 @@ func writeEntry(tw *tar.Writer, p, rel string, d fs.DirEntry) error {
 	_, err = io.CopyN(tw, f, h.Size)
 	return err
 }
-func Unpack(r io.Reader, root string, maxBytes int64) error {
-	dec, err := zstd.NewReader(r)
+
+func Unpack(r io.Reader, root string, include []string, limits Limits) error {
+	dec, err := zstd.NewReader(r, zstd.WithDecoderMaxWindow(maxWindow))
 	if err != nil {
 		return err
 	}
 	defer dec.Close()
 	tr := tar.NewReader(dec)
+	count := &counter{limits: limits}
 
-	var written int64
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -114,9 +162,19 @@ func Unpack(r io.Reader, root string, maxBytes int64) error {
 		if err != nil {
 			return err
 		}
+		size := int64(0)
+		if h.Typeflag == tar.TypeReg {
+			size = h.Size
+		}
+		if err := count.add(size); err != nil {
+			return err
+		}
 		rel, err := safeRel(h.Name)
 		if err != nil {
 			return err
+		}
+		if !included(include, rel) {
+			continue
 		}
 		if err := mkdirInside(root, path.Dir(rel)); err != nil {
 			return err
@@ -129,9 +187,6 @@ func Unpack(r io.Reader, root string, maxBytes int64) error {
 				return err
 			}
 		case tar.TypeReg:
-			if written += h.Size; written > maxBytes {
-				return fmt.Errorf("state is larger than %d bytes", maxBytes)
-			}
 			if err := writeRegular(target, tr, h); err != nil {
 				return err
 			}
@@ -153,6 +208,7 @@ func safeRel(name string) (string, error) {
 	}
 	return clean, nil
 }
+
 func mkdirInside(root, rel string) error {
 	if rel == "." {
 		return nil
@@ -174,6 +230,7 @@ func mkdirInside(root, rel string) error {
 	}
 	return nil
 }
+
 func replace(target string) error {
 	info, err := os.Lstat(target)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -204,4 +261,36 @@ func writeRegular(target string, r io.Reader, h *tar.Header) error {
 		return err
 	}
 	return os.Chtimes(target, h.ModTime, h.ModTime)
+}
+
+func moveInto(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		from := filepath.Join(src, e.Name())
+		to := filepath.Join(dst, e.Name())
+		info, err := os.Lstat(to)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return err
+		case info.IsDir() && e.IsDir():
+			if err := moveInto(from, to); err != nil {
+				return err
+			}
+			continue
+		case info.IsDir():
+			return fmt.Errorf("directory in place of file: %s", to)
+		default:
+			if err := os.Remove(to); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(from, to); err != nil {
+			return err
+		}
+	}
+	return nil
 }

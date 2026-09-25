@@ -62,8 +62,6 @@ func (s *Systemctl) Restart(ctx context.Context, unit string) error {
 	return err
 }
 
-// IsActive treats a non-active exit code as `false` rather than an error — `systemctl is-active`
-// exits non-zero whenever the unit is not active, even for normal states like "inactive".
 func (s *Systemctl) IsActive(ctx context.Context, unit string) (bool, error) {
 	out, err := s.exec.Run(ctx, defaultSystemctlTimeout, "systemctl", "is-active", unit)
 	state := strings.TrimSpace(out)

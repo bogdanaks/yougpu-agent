@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,15 +91,24 @@ func TestTerminationKeepsSyncingWhenUploadsUnknown(t *testing.T) {
 	}
 }
 
-type recordingDocker struct{ order *[]string }
+type fakeDocker struct {
+	order    *[]string
+	alive    []string
+	stubborn bool
+}
 
-func (r recordingDocker) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
+func (d *fakeDocker) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
 	if name != "docker" {
 		return "", nil
 	}
-	*r.order = append(*r.order, name+" "+args[0])
-	if len(args) > 0 && args[0] == "ps" {
-		return "abc\n", nil
+	*d.order = append(*d.order, "docker "+args[0])
+	switch args[0] {
+	case "ps":
+		return strings.Join(d.alive, "\n"), nil
+	case "stop", "kill":
+		if !d.stubborn {
+			d.alive = nil
+		}
 	}
 	return "", nil
 }
@@ -111,40 +121,115 @@ func (o orderStopper) Stop(_ context.Context, unit string) error {
 }
 func (o orderStopper) Poweroff(context.Context) error { return nil }
 
+func hooksInto(order *[]string, done bool, stopErr *error) Hooks {
+	return Hooks{
+		BeforeStop: func(context.Context) { *order = append(*order, "freeze") },
+		AfterStop: func(_ context.Context, err error) bool {
+			*order = append(*order, "save")
+			if stopErr != nil {
+				*stopErr = err
+			}
+			return done
+		},
+	}
+}
+
 func TestTerminationSavesStateBetweenStopAndUnmount(t *testing.T) {
 	var order []string
-	m := NewManager(t.TempDir(), orderStopper{&order}, recordingDocker{&order}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	hooks := Hooks{
-		BeforeStop: func(context.Context) { order = append(order, "freeze") },
-		AfterStop:  func(context.Context) { order = append(order, "save") },
-	}
+	docker := &fakeDocker{order: &order, alive: []string{"abc"}}
+	m := NewManager(t.TempDir(), orderStopper{&order}, docker, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	state, err := m.HandleTermination(context.Background(), &fakeDisker{units: []string{"d1"}}, hooks)
+	state, err := m.HandleTermination(context.Background(), &fakeDisker{units: []string{"d1"}}, hooksInto(&order, true, nil))
 
 	if err != nil || state != StateSynced {
 		t.Fatalf("state = %q, %v", state, err)
 	}
-	want := []string{"freeze", "docker ps", "docker stop", "save", "unmount storage-mount-d1.service"}
+	want := []string{"freeze", "docker ps", "docker stop", "docker ps", "save", "unmount storage-mount-d1.service"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("order = %v; want %v", order, want)
 	}
 }
 
-func TestRecoveredTerminationSavesWithoutFreezing(t *testing.T) {
+func TestRecoveredTerminationStopsContainersBeforeSaving(t *testing.T) {
 	var order []string
-	m := NewManager(t.TempDir(), orderStopper{&order}, recordingDocker{&order}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	docker := &fakeDocker{order: &order, alive: []string{"abc"}}
+	m := NewManager(t.TempDir(), orderStopper{&order}, docker, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := m.SetState(StateSyncing); err != nil {
 		t.Fatal(err)
 	}
-	hooks := Hooks{
-		BeforeStop: func(context.Context) { order = append(order, "freeze") },
-		AfterStop:  func(context.Context) { order = append(order, "save") },
-	}
 
-	if _, err := m.HandleTermination(context.Background(), &fakeDisker{}, hooks); err != nil {
+	if _, err := m.HandleTermination(context.Background(), &fakeDisker{}, hooksInto(&order, true, nil)); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(order, []string{"save"}) {
-		t.Fatalf("order = %v; want only save", order)
+	want := []string{"docker ps", "docker stop", "docker ps", "save"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("order = %v; want %v", order, want)
+	}
+}
+
+func TestTerminationKillsContainerThatIgnoresStop(t *testing.T) {
+	var order []string
+	docker := &fakeDocker{order: &order, alive: []string{"abc"}}
+	m := NewManager(t.TempDir(), orderStopper{&order}, &stopIgnored{docker}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var stopErr error
+
+	state, _ := m.HandleTermination(context.Background(), &fakeDisker{}, hooksInto(&order, true, &stopErr))
+
+	if state != StateSynced || stopErr != nil {
+		t.Fatalf("state=%s stopErr=%v", state, stopErr)
+	}
+	want := []string{"freeze", "docker ps", "docker stop", "docker ps", "docker kill", "docker ps", "save"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("order = %v; want %v", order, want)
+	}
+}
+
+type stopIgnored struct{ *fakeDocker }
+
+func (s *stopIgnored) Run(ctx context.Context, d time.Duration, name string, args ...string) (string, error) {
+	if name == "docker" && args[0] == "stop" {
+		*s.order = append(*s.order, "docker stop")
+		return "", nil
+	}
+	return s.fakeDocker.Run(ctx, d, name, args...)
+}
+
+func TestTerminationReportsContainerThatSurvivesKill(t *testing.T) {
+	var order []string
+	docker := &fakeDocker{order: &order, alive: []string{"abc"}, stubborn: true}
+	m := NewManager(t.TempDir(), orderStopper{&order}, docker, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var stopErr error
+
+	m.HandleTermination(context.Background(), &fakeDisker{}, hooksInto(&order, false, &stopErr))
+
+	if stopErr == nil || !strings.Contains(stopErr.Error(), "контейнер не остановился") {
+		t.Fatalf("save must learn the container is alive, got %v", stopErr)
+	}
+}
+
+func TestTerminationKeepsDisksWhileSaveRetries(t *testing.T) {
+	var order []string
+	docker := &fakeDocker{order: &order}
+	m := NewManager(t.TempDir(), orderStopper{&order}, docker, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	disk := &fakeDisker{units: []string{"d1"}}
+
+	state, err := m.HandleTermination(context.Background(), disk, hooksInto(&order, false, nil))
+	if err != nil || state != StateSyncing {
+		t.Fatalf("state = %q, %v; want syncing", state, err)
+	}
+	for _, step := range order {
+		if strings.HasPrefix(step, "unmount") {
+			t.Fatalf("disk flushed while the save is still retrying: %v", order)
+		}
+	}
+
+	order = nil
+	state, err = m.HandleTermination(context.Background(), disk, hooksInto(&order, true, nil))
+	if err != nil || state != StateSynced {
+		t.Fatalf("state = %q, %v; want synced", state, err)
+	}
+	want := []string{"docker ps", "save", "unmount storage-mount-d1.service"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("order = %v; want %v", order, want)
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
@@ -21,6 +23,8 @@ const (
 	containerReadyTimeout       = 3 * time.Minute
 	containerReadyProbeInterval = 2 * time.Second
 	endpointDialTimeout         = 2 * time.Second
+	poweroffDelay               = 5 * time.Second
+	phaseReportTimeout          = 5 * time.Second
 )
 
 type AgentClient interface {
@@ -61,8 +65,11 @@ type HostSetup interface {
 }
 
 type ContentReconciler interface {
-	Reconcile(ctx context.Context, spec *client.AgentContentSpec, container *client.AgentContainerSpec) client.AgentContentObserved
+	Reconcile(ctx context.Context, spec *client.AgentContentSpec, container *client.AgentContainerSpec)
+	Observe() (client.AgentContentObserved, bool)
+	Stop()
 	SetReporter(func(context.Context, client.AgentContentObserved))
+	SetNotify(func())
 }
 
 type LifecycleManager interface {
@@ -75,8 +82,10 @@ type LifecycleManager interface {
 type StateManager interface {
 	Restore(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec) (bool, *client.AgentStateObserved)
 	Freeze(ctx context.Context, spec *client.AgentStateSpec, containerName string)
-	Save(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec) *client.AgentStateObserved
+	Save(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec, stopErr error) *client.AgentStateObserved
+	Outcome() *client.AgentStateObserved
 	SetReporter(func(context.Context, client.AgentStateObserved))
+	SetNotify(func())
 }
 
 type CredsProvider interface {
@@ -108,8 +117,37 @@ type Agent struct {
 	cfg                Config
 	started            time.Time
 	knownDiskID        map[string]bool
-	lastSpec           *client.AgentSpec
+	lastSpec           atomic.Pointer[client.AgentSpec]
 	containerReadyHash string
+	inbox              inbox
+	wake               chan struct{}
+
+	aliveMu     sync.Mutex
+	aliveCtx    context.Context
+	aliveCancel context.CancelFunc
+	deleting    bool
+}
+
+type inbox struct {
+	mu     sync.Mutex
+	latest *client.AgentSpec
+	signal chan struct{}
+}
+
+func (b *inbox) put(spec *client.AgentSpec) {
+	b.mu.Lock()
+	b.latest = spec
+	b.mu.Unlock()
+	select {
+	case b.signal <- struct{}{}:
+	default:
+	}
+}
+
+func (b *inbox) get() *client.AgentSpec {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.latest
 }
 
 func New(cfg Config) *Agent {
@@ -126,6 +164,8 @@ func New(cfg Config) *Agent {
 		cfg:         cfg,
 		started:     time.Now(),
 		knownDiskID: map[string]bool{},
+		inbox:       inbox{signal: make(chan struct{}, 1)},
+		wake:        make(chan struct{}, 1),
 	}
 	if cfg.Container != nil {
 		cfg.Container.SetReporter(a.reportContainerPhase)
@@ -135,29 +175,78 @@ func New(cfg Config) *Agent {
 	}
 	if cfg.Content != nil {
 		cfg.Content.SetReporter(a.reportContentPhase)
+		cfg.Content.SetNotify(a.poke)
 	}
 	if cfg.State != nil {
 		cfg.State.SetReporter(a.reportStatePhase)
+		cfg.State.SetNotify(a.poke)
 	}
 	return a
 }
 
-func (a *Agent) reportStatePhase(ctx context.Context, obs client.AgentStateObserved) {
-	if a.lastSpec == nil {
+func (a *Agent) poke() {
+	select {
+	case a.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Agent) aliveContext(parent context.Context) context.Context {
+	a.aliveMu.Lock()
+	defer a.aliveMu.Unlock()
+	if a.deleting {
+		ctx, cancel := context.WithCancel(parent)
+		cancel()
+		return ctx
+	}
+	if a.aliveCtx == nil || a.aliveCtx.Err() != nil {
+		a.aliveCtx, a.aliveCancel = context.WithCancel(parent)
+	}
+	return a.aliveCtx
+}
+
+func (a *Agent) stopAlive() {
+	a.aliveMu.Lock()
+	defer a.aliveMu.Unlock()
+	a.deleting = true
+	if a.aliveCancel != nil {
+		a.aliveCancel()
+	}
+}
+
+func (a *Agent) reportPhase(ctx context.Context, kind, state string, fill func(*client.AgentStatus)) {
+	spec := a.lastSpec.Load()
+	if spec == nil {
 		return
 	}
 	status := &client.AgentStatus{
-		ObservedGeneration: a.lastSpec.Generation,
+		ObservedGeneration: spec.Generation,
 		Lifecycle:          client.StatusLifecycle{ObservedState: a.cfg.Lifecycle.CurrentState()},
-		State:              &obs,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
 	}
-	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	fill(status)
+	reportCtx, cancel := context.WithTimeout(ctx, phaseReportTimeout)
 	defer cancel()
 	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
-		a.cfg.Logger.Warn("state phase report failed", "state", obs.ObservedState, "err", err)
+		a.cfg.Logger.Warn(kind+" phase report failed", "state", state, "err", err)
 	}
+}
+
+func (a *Agent) reportStatePhase(ctx context.Context, obs client.AgentStateObserved) {
+	a.reportPhase(ctx, "state", obs.ObservedState, func(s *client.AgentStatus) { s.State = &obs })
+}
+
+func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContainerObserved) {
+	a.reportPhase(ctx, "container", obs.ObservedState, func(s *client.AgentStatus) { s.Container = &obs })
+}
+
+func (a *Agent) reportSetupPhase(ctx context.Context, obs client.AgentSetupObserved) {
+	a.reportPhase(ctx, "setup", obs.ObservedState, func(s *client.AgentStatus) { s.Setup = &obs })
+}
+
+func (a *Agent) reportContentPhase(ctx context.Context, obs client.AgentContentObserved) {
+	a.reportPhase(ctx, "content", obs.ObservedState, func(s *client.AgentStatus) { s.Content = &obs })
 }
 
 func (a *Agent) terminationHooks(spec *client.AgentSpec, saved **client.AgentStateObserved) lifecycle.Hooks {
@@ -166,66 +255,13 @@ func (a *Agent) terminationHooks(spec *client.AgentSpec, saved **client.AgentSta
 	}
 	return lifecycle.Hooks{
 		BeforeStop: func(ctx context.Context) {
-			a.reportStatePhase(ctx, client.AgentStateObserved{ObservedState: client.StateSaving})
 			a.cfg.State.Freeze(ctx, spec.State, container.AppContainerName)
 		},
-		AfterStop: func(ctx context.Context) {
-			*saved = a.cfg.State.Save(ctx, spec.State, spec.Container)
+		AfterStop: func(ctx context.Context, stopErr error) bool {
+			obs := a.cfg.State.Save(ctx, spec.State, spec.Container, stopErr)
+			*saved = obs
+			return obs == nil || obs.ObservedState != client.StateSaving
 		},
-	}
-}
-
-func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContainerObserved) {
-	if a.lastSpec == nil {
-		return
-	}
-	status := &client.AgentStatus{
-		ObservedGeneration: a.lastSpec.Generation,
-		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
-		Container:          &obs,
-		AgentVersion:       a.cfg.Version,
-		UptimeSec:          int64(time.Since(a.started).Seconds()),
-	}
-	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
-		a.cfg.Logger.Warn("container phase report failed", "state", obs.ObservedState, "err", err)
-	}
-}
-
-func (a *Agent) reportSetupPhase(ctx context.Context, obs client.AgentSetupObserved) {
-	if a.lastSpec == nil {
-		return
-	}
-	status := &client.AgentStatus{
-		ObservedGeneration: a.lastSpec.Generation,
-		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
-		Setup:              &obs,
-		AgentVersion:       a.cfg.Version,
-		UptimeSec:          int64(time.Since(a.started).Seconds()),
-	}
-	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
-		a.cfg.Logger.Warn("setup phase report failed", "state", obs.ObservedState, "err", err)
-	}
-}
-
-func (a *Agent) reportContentPhase(ctx context.Context, obs client.AgentContentObserved) {
-	if a.lastSpec == nil {
-		return
-	}
-	status := &client.AgentStatus{
-		ObservedGeneration: a.lastSpec.Generation,
-		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
-		Content:            &obs,
-		AgentVersion:       a.cfg.Version,
-		UptimeSec:          int64(time.Since(a.started).Seconds()),
-	}
-	reportCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
-		a.cfg.Logger.Warn("content phase report failed", "state", obs.ObservedState, "err", err)
 	}
 }
 
@@ -262,7 +298,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	specs := make(chan *client.AgentSpec, 4)
+	streamDone := make(chan struct{})
 	go a.streamLoop(ctx, cancel, specs)
+	go a.intake(specs, streamDone)
 
 	reconcileTicker := time.NewTicker(a.cfg.ReconcileInterval)
 	defer reconcileTicker.Stop()
@@ -271,42 +309,53 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case spec, ok := <-specs:
-			if !ok {
-				return nil
-			}
-			a.lastSpec = spec
-			if err := a.handleSpec(ctx, spec); err != nil {
-				if client.IsGone(err) {
-					a.cfg.Logger.Info("backend returned 410 Gone, stopping agent")
-					return nil
-				}
-				a.cfg.Logger.Error("handle spec failed", "err", err)
-				continue
-			}
-			if a.cfg.Lifecycle.CurrentState() == lifecycle.StateSynced {
-				a.cfg.Logger.Info("lifecycle synced; initiating poweroff in 5s")
-				time.Sleep(5 * time.Second)
-				if err := a.cfg.Lifecycle.Poweroff(ctx); err != nil {
-					a.cfg.Logger.Error("poweroff failed", "err", err)
-					return err
-				}
-				return nil
-			}
+		case <-streamDone:
+			return nil
+		case <-a.inbox.signal:
+		case <-a.wake:
 		case <-reconcileTicker.C:
-			if a.lastSpec == nil {
-				continue
+		}
+		spec := a.inbox.get()
+		if spec == nil {
+			continue
+		}
+		a.lastSpec.Store(spec)
+		if err := a.handleSpec(ctx, spec); err != nil {
+			if client.IsGone(err) {
+				a.cfg.Logger.Info("backend returned 410 Gone, stopping agent")
+				return nil
 			}
-			a.cfg.Logger.Debug("periodic reconcile tick")
-			if err := a.handleSpec(ctx, a.lastSpec); err != nil {
-				if client.IsGone(err) {
-					a.cfg.Logger.Info("backend returned 410 Gone during reconcile, stopping agent")
-					return nil
-				}
-				a.cfg.Logger.Warn("periodic reconcile failed", "err", err)
-			}
+			a.cfg.Logger.Error("handle spec failed", "err", err)
+			continue
+		}
+		if a.cfg.Lifecycle.CurrentState() == lifecycle.StateSynced {
+			return a.powerOff(ctx)
 		}
 	}
+}
+
+func (a *Agent) intake(specs <-chan *client.AgentSpec, done chan<- struct{}) {
+	defer close(done)
+	for spec := range specs {
+		a.inbox.put(spec)
+		if spec.Lifecycle.DeletionRequestedAt != nil {
+			a.stopAlive()
+		}
+	}
+}
+
+func (a *Agent) powerOff(ctx context.Context) error {
+	a.cfg.Logger.Info("lifecycle synced; initiating poweroff", "delay", poweroffDelay.String())
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-time.After(poweroffDelay):
+	}
+	if err := a.cfg.Lifecycle.Poweroff(ctx); err != nil {
+		a.cfg.Logger.Error("poweroff failed", "err", err)
+		return err
+	}
+	return nil
 }
 
 func (a *Agent) streamLoop(ctx context.Context, cancel context.CancelFunc, out chan<- *client.AgentSpec) {
@@ -362,105 +411,124 @@ func (a *Agent) heartbeatLoop(ctx context.Context, cancel context.CancelFunc) {
 }
 
 func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
-	observedLifecycle := lifecycle.StateAlive
-	var disksObserved []client.AgentDiskObserved
-	var stateObserved *client.AgentStateObserved
-
 	if spec.Lifecycle.DeletionRequestedAt != nil {
-		state, err := a.cfg.Lifecycle.HandleTermination(ctx, a.cfg.Disk, a.terminationHooks(spec, &stateObserved))
-		if err != nil {
-			a.cfg.Logger.Error("termination handling failed", "err", err)
+		return a.terminate(ctx, spec)
+	}
+	work := a.aliveContext(ctx)
+	_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
+
+	if a.cfg.SSHKeys != nil && spec.SSH != nil {
+		if err := a.cfg.SSHKeys.Reconcile(spec.SSH); err != nil {
+			a.cfg.Logger.Error("ssh keys reconcile failed", "err", err)
 		}
-		observedLifecycle = state
 	}
 
-	var containerObserved *client.AgentContainerObserved
-	var firewallObserved *client.AgentFirewallObserved
 	var setupObserved *client.AgentSetupObserved
-	var contentObserved *client.AgentContentObserved
-	if spec.Lifecycle.DeletionRequestedAt == nil {
-		_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
-
-		if a.cfg.SSHKeys != nil && spec.SSH != nil {
-			if err := a.cfg.SSHKeys.Reconcile(spec.SSH); err != nil {
-				a.cfg.Logger.Error("ssh keys reconcile failed", "err", err)
+	if a.cfg.HostSetup != nil {
+		obs := a.cfg.HostSetup.Reconcile(work)
+		setupObserved = &obs
+		if obs.ObservedState != client.SetupReady {
+			if work.Err() != nil {
+				return nil
 			}
-		}
-
-		if a.cfg.HostSetup != nil {
-			obs := a.cfg.HostSetup.Reconcile(ctx)
-			setupObserved = &obs
-			if obs.ObservedState != client.SetupReady {
-				return a.postStatus(ctx, &client.AgentStatus{
-					ObservedGeneration: spec.Generation,
-					Lifecycle:          client.StatusLifecycle{ObservedState: observedLifecycle},
-					Setup:              setupObserved,
-					AgentVersion:       a.cfg.Version,
-					UptimeSec:          int64(time.Since(a.started).Seconds()),
-				})
-			}
-		}
-
-		a.refreshCredsIfDiskSetChanged(ctx, spec)
-		disksObserved = a.reconcileDisks(ctx, spec)
-
-		contentDone := make(chan struct{})
-		if a.cfg.Content != nil && spec.Content != nil {
-			go func() {
-				defer close(contentDone)
-				obs := a.cfg.Content.Reconcile(ctx, spec.Content, spec.Container)
-				contentObserved = &obs
-				if obs.ObservedState == client.ContentError {
-					a.cfg.Logger.Error("content reconcile failed", "err", deref(obs.LastError))
-				}
-			}()
-		} else {
-			close(contentDone)
-		}
-
-		stateReady := true
-		stateDone := make(chan struct{})
-		if a.cfg.State != nil && spec.State != nil {
-			go func() {
-				defer close(stateDone)
-				stateReady, stateObserved = a.cfg.State.Restore(ctx, spec.State, spec.Container)
-			}()
-		} else {
-			close(stateDone)
-		}
-
-		if a.cfg.Container != nil {
-			obs := a.cfg.Container.Reconcile(ctx, spec.Container, func() bool {
-				<-contentDone
-				<-stateDone
-				return stateReady
+			return a.postStatus(ctx, &client.AgentStatus{
+				ObservedGeneration: spec.Generation,
+				Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
+				Setup:              setupObserved,
+				AgentVersion:       a.cfg.Version,
+				UptimeSec:          int64(time.Since(a.started).Seconds()),
 			})
-			containerObserved = &obs
 		}
-		<-contentDone
-		<-stateDone
-		if a.cfg.Firewall != nil && spec.Firewall != nil {
-			obs := a.cfg.Firewall.Reconcile(ctx, spec.Firewall)
-			firewallObserved = &obs
+	}
+
+	a.refreshCredsIfDiskSetChanged(work, spec)
+	disksObserved := a.reconcileDisks(work, spec)
+
+	hasContent := a.cfg.Content != nil && spec.Content != nil
+	if hasContent {
+		a.cfg.Content.Reconcile(work, spec.Content, spec.Container)
+	} else if a.cfg.Content != nil {
+		a.cfg.Content.Stop()
+	}
+
+	stateReady := true
+	var stateObserved *client.AgentStateObserved
+	restore := func() {
+		if a.cfg.State != nil && spec.State != nil {
+			stateReady, stateObserved = a.cfg.State.Restore(work, spec.State, spec.Container)
 		}
-		if a.cfg.Tunnel != nil {
-			a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
-		}
-		if containerObserved != nil && containerObserved.ObservedState == client.ContainerRunning {
-			if a.ensureContainerReady(ctx, spec, containerObserved.SpecHash) {
-				containerObserved.ObservedState = client.ContainerReady
+	}
+	restore()
+
+	var containerObserved *client.AgentContainerObserved
+	if a.cfg.Container != nil {
+		obs := a.cfg.Container.Reconcile(work, spec.Container, func() bool {
+			restore()
+			if hasContent {
+				if _, settled := a.cfg.Content.Observe(); !settled {
+					return false
+				}
 			}
+			return stateReady
+		})
+		containerObserved = &obs
+	}
+	var firewallObserved *client.AgentFirewallObserved
+	if a.cfg.Firewall != nil && spec.Firewall != nil {
+		obs := a.cfg.Firewall.Reconcile(work, spec.Firewall)
+		firewallObserved = &obs
+	}
+	if a.cfg.Tunnel != nil {
+		a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
+	}
+	if containerObserved != nil && containerObserved.ObservedState == client.ContainerRunning {
+		if a.ensureContainerReady(work, spec, containerObserved.SpecHash) {
+			containerObserved.ObservedState = client.ContainerReady
+		}
+	}
+	if work.Err() != nil {
+		return nil
+	}
+
+	var contentObserved *client.AgentContentObserved
+	if hasContent {
+		obs, _ := a.cfg.Content.Observe()
+		contentObserved = &obs
+		if obs.ObservedState == client.ContentError {
+			a.cfg.Logger.Error("content reconcile failed", "err", deref(obs.LastError))
 		}
 	}
 
 	return a.postStatus(ctx, &client.AgentStatus{
 		ObservedGeneration: spec.Generation,
-		Lifecycle:          client.StatusLifecycle{ObservedState: observedLifecycle},
+		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
 		Disks:              disksObserved,
 		Container:          containerObserved,
 		Firewall:           firewallObserved,
 		Setup:              setupObserved,
 		Content:            contentObserved,
+		State:              stateObserved,
+		AgentVersion:       a.cfg.Version,
+		UptimeSec:          int64(time.Since(a.started).Seconds()),
+	})
+}
+
+func (a *Agent) terminate(ctx context.Context, spec *client.AgentSpec) error {
+	a.stopAlive()
+	if a.cfg.Content != nil {
+		a.cfg.Content.Stop()
+	}
+	var stateObserved *client.AgentStateObserved
+	observed, err := a.cfg.Lifecycle.HandleTermination(ctx, a.cfg.Disk, a.terminationHooks(spec, &stateObserved))
+	if err != nil {
+		a.cfg.Logger.Error("termination handling failed", "err", err)
+	}
+	if stateObserved == nil && a.cfg.State != nil {
+		stateObserved = a.cfg.State.Outcome()
+	}
+	return a.postStatus(ctx, &client.AgentStatus{
+		ObservedGeneration: spec.Generation,
+		Lifecycle:          client.StatusLifecycle{ObservedState: observed},
 		State:              stateObserved,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
@@ -667,6 +735,9 @@ func (a *Agent) waitForDestroy(ctx context.Context) error {
 				Lifecycle:    client.StatusLifecycle{ObservedState: lifecycle.StateSynced},
 				AgentVersion: a.cfg.Version,
 				UptimeSec:    int64(time.Since(a.started).Seconds()),
+			}
+			if a.cfg.State != nil {
+				status.State = a.cfg.State.Outcome()
 			}
 			if err := a.cfg.Client.PostStatus(ctx, status); err != nil {
 				a.cfg.Logger.Warn("post-synced status failed", "err", err)

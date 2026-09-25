@@ -2,8 +2,6 @@ package reconcile
 
 import "github.com/bogdanaks/yougpu-agent/internal/client"
 
-// Reconcile returns the list of actions needed to bring observed state into spec.
-// Pure function: no I/O, fully unit-testable.
 func Reconcile(spec *client.AgentSpec, observed ObservedState) []Action {
 	if spec == nil {
 		return nil
