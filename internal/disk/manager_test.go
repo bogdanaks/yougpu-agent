@@ -130,6 +130,39 @@ func TestMountWritesUnitAndStarts(t *testing.T) {
 	}
 }
 
+func TestMountUnitReadsAndUploadsInParallel(t *testing.T) {
+	m, _, tmp := newTestManager(t)
+	spec := client.AgentDiskSpec{
+		ID:           "abc",
+		DesiredState: client.DesiredMounted,
+		Bucket:       "test-bucket",
+		S3Path:       "u/abc/",
+		MountPath:    filepath.Join(t.TempDir(), "mount"),
+	}
+
+	if err := m.Mount(context.Background(), spec); err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(tmp, "storage-mount-abc.service"))
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	for _, flag := range []string{
+		"--vfs-read-chunk-streams 32",
+		"--vfs-read-chunk-size 4M",
+		"--s3-upload-concurrency 16",
+		"--s3-chunk-size 64M",
+	} {
+		if !bytes.Contains(body, []byte(flag)) {
+			t.Errorf("unit missing %s:\n%s", flag, body)
+		}
+	}
+	if bytes.Contains(body, []byte("--vfs-read-chunk-size-limit")) {
+		t.Errorf("chunk size limit has no effect with parallel chunk streams:\n%s", body)
+	}
+}
+
 func TestUnmountRemovesUnit(t *testing.T) {
 	m, sd, tmp := newTestManager(t)
 	unitName := "storage-mount-xyz.service"
