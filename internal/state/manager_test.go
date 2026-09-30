@@ -22,18 +22,6 @@ import (
 	"github.com/bogdanaks/yougpu-agent/internal/container"
 )
 
-type fakeExec struct {
-	mu    sync.Mutex
-	calls []string
-}
-
-func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
-	return "", nil
-}
-
 type recorder struct {
 	mu   sync.Mutex
 	list []client.AgentStateObserved
@@ -65,16 +53,16 @@ func (r *recorder) count(state string) int {
 	return n
 }
 
-func newManager(t *testing.T) (*Manager, *fakeExec, *recorder) {
+func newManager(t *testing.T) (*Manager, *recorder) {
 	t.Helper()
-	exec := &fakeExec{}
 	rec := &recorder{}
-	m := New(t.TempDir(), exec, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.retryDelay = time.Millisecond
 	m.restoringEvery = 10 * time.Millisecond
 	m.saveWindow = time.Hour
+	m.restoreTimeout = 2 * time.Second
 	m.SetReporter(rec.report)
-	return m, exec, rec
+	return m, rec
 }
 
 func ranHere(t *testing.T, m *Manager) {
@@ -147,7 +135,7 @@ func restoreSpec(url, sum string, size int) *client.AgentStateSpec {
 }
 
 func TestNoStateStartsContainer(t *testing.T) {
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	ok, obs := m.Restore(context.Background(), nil, workspace(t.TempDir()))
 	if !ok || obs != nil {
 		t.Fatalf("ok=%v obs=%v", ok, obs)
@@ -155,7 +143,7 @@ func TestNoStateStartsContainer(t *testing.T) {
 }
 
 func TestRestoreWaitsWhileArchiveIsSaved(t *testing.T) {
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	ok, obs := m.Restore(context.Background(), &client.AgentStateSpec{Pending: true}, workspace(t.TempDir()))
 	if ok || obs.ObservedState != client.StateWaiting {
 		t.Fatalf("ok=%v state=%s", ok, obs.ObservedState)
@@ -163,7 +151,7 @@ func TestRestoreWaitsWhileArchiveIsSaved(t *testing.T) {
 }
 
 func TestCleanStartIsReportedRestored(t *testing.T) {
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	ok, obs := m.Restore(context.Background(), &client.AgentStateSpec{}, workspace(t.TempDir()))
 	if !ok || obs.ObservedState != client.StateRestored {
 		t.Fatalf("ok=%v obs=%+v", ok, obs)
@@ -174,7 +162,7 @@ func TestRestoreUnpacksVerifiedArchiveOnce(t *testing.T) {
 	body, sum := archiveOf(t, map[string]string{"custom_nodes/pack/__init__.py": "nodes", "user/default/tabs.json": "{}"})
 	srv, hits := serve(body)
 	defer srv.Close()
-	m, _, rec := newManager(t)
+	m, rec := newManager(t)
 	var notified atomic.Int32
 	m.SetNotify(func() { notified.Add(1) })
 	root := t.TempDir()
@@ -219,7 +207,7 @@ func TestRestoreRunsInBackgroundAndKeepsReporting(t *testing.T) {
 		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
-	m, _, rec := newManager(t)
+	m, rec := newManager(t)
 	root := t.TempDir()
 	spec := restoreSpec(srv.URL, sum, len(body))
 
@@ -249,7 +237,7 @@ func TestRestoreRejectsTamperedArchive(t *testing.T) {
 	body, _ := archiveOf(t, map[string]string{"user/default/tabs.json": "{}"})
 	srv, hits := serve(body)
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	root := t.TempDir()
 	spec := restoreSpec(srv.URL, strings.Repeat("0", 64), len(body))
 
@@ -261,8 +249,94 @@ func TestRestoreRejectsTamperedArchive(t *testing.T) {
 	if exists(root, "user") {
 		t.Fatal("tampered archive unpacked")
 	}
-	if hits.Load() != attempts {
-		t.Fatalf("failed restore must not start over on every call, hits=%d", hits.Load())
+	if hits.Load() != 1 {
+		t.Fatalf("archive that fails its checksum must not be downloaded again, hits=%d", hits.Load())
+	}
+	if !strings.HasPrefix(*obs.LastError, "state sha256 mismatch") {
+		t.Fatalf("broken archive must not look like a download failure: %s", *obs.LastError)
+	}
+}
+
+func TestRestoreResumesBrokenDownload(t *testing.T) {
+	body, sum := archiveOf(t, map[string]string{"user/default/tabs.json": "{}", "custom_nodes/pack/x.py": string(randomBytes(4096))})
+	half := len(body) / 2
+	var mu sync.Mutex
+	var ranges []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		first := len(ranges) == 1
+		mu.Unlock()
+		if first {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			_, _ = w.Write(body[:half])
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		}
+		http.ServeContent(w, r, "state", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+	m, _ := newManager(t)
+	root := t.TempDir()
+
+	ok, obs := restoreWithin(t, m, restoreSpec(srv.URL, sum, len(body)), root)
+
+	if !ok || obs.ObservedState != client.StateRestored {
+		t.Fatalf("ok=%v obs=%+v", ok, obs)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ranges) != 2 || ranges[1] != "bytes="+strconv.Itoa(half)+"-" {
+		t.Fatalf("second request must continue from byte %d, got ranges %q", half, ranges)
+	}
+}
+
+func TestRestoreRetriesWithGrowingPause(t *testing.T) {
+	body, sum := archiveOf(t, map[string]string{"user/default/tabs.json": "{}"})
+	var mu sync.Mutex
+	var at []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		at = append(at, time.Now())
+		n := len(at)
+		mu.Unlock()
+		if n <= 4 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	m, _ := newManager(t)
+	m.retryDelay = 20 * time.Millisecond
+
+	ok, obs := restoreWithin(t, m, restoreSpec(srv.URL, sum, len(body)), t.TempDir())
+
+	if !ok || obs.ObservedState != client.StateRestored {
+		t.Fatalf("restore must outlast a short outage, ok=%v obs=%+v", ok, obs)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, min := range []time.Duration{20, 40, 80} {
+		if gap := at[i+1].Sub(at[i]); gap < min*time.Millisecond {
+			t.Fatalf("pause %d is %v, want at least %v", i+1, gap, min*time.Millisecond)
+		}
+	}
+}
+
+func TestRestoreDoesNotRetryMissingArchive(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	m, _ := newManager(t)
+
+	ok, obs := restoreWithin(t, m, restoreSpec(srv.URL, strings.Repeat("0", 64), 10), t.TempDir())
+
+	if ok || obs.LastError == nil || *obs.LastError != "state download: http 404" || hits.Load() != 1 {
+		t.Fatalf("ok=%v obs=%+v hits=%d", ok, obs, hits.Load())
 	}
 }
 
@@ -270,7 +344,7 @@ func TestBrokenArchiveLeavesNoHalfWorkspace(t *testing.T) {
 	body, sum := digest(hostile(t, regular("user/default/tabs.json", 2), regular("custom_nodes/pack/x.py", 2), regular("../escape", 1)).Bytes())
 	srv, _ := serve(body)
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	root := t.TempDir()
 
 	ok, obs := restoreWithin(t, m, restoreSpec(srv.URL, sum, len(body)), root)
@@ -288,7 +362,7 @@ func TestRestoreMergesIntoWorkspace(t *testing.T) {
 	body, sum := archiveOf(t, map[string]string{"user/default/tabs.json": "{}", "comfyui.db": "new"})
 	srv, _ := serve(body)
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	root := t.TempDir()
 	writeFile(t, root, "user/default/workflows/wf.json", "graph", 0o644)
 	writeFile(t, root, "models/vae/m.bin", "weights", 0o644)
@@ -311,7 +385,7 @@ func TestRestoreGivesUpAtDeadline(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	m.restoreTimeout = 100 * time.Millisecond
 
 	ok, obs := restoreWithin(t, m, restoreSpec(srv.URL, strings.Repeat("0", 64), 10), t.TempDir())
@@ -329,20 +403,22 @@ func TestRestoreDownloadFailsWhenServerGoesSilent(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	m.idle = 100 * time.Millisecond
+	m.restoreTimeout = 500 * time.Millisecond
 
 	ok, obs := restoreWithin(t, m, restoreSpec(srv.URL, strings.Repeat("0", 64), 1000), t.TempDir())
 
-	if ok || obs.LastError == nil || !strings.Contains(*obs.LastError, "no data for 100ms") {
+	if ok || obs.LastError == nil || !strings.Contains(*obs.LastError, "no data for 100ms") || !strings.HasPrefix(*obs.LastError, "state download:") {
 		t.Fatalf("ok=%v obs=%+v", ok, obs)
 	}
 }
 
 func TestRestoreErrorsDoNotLeakSignedURL(t *testing.T) {
 	var logs bytes.Buffer
-	m := New(t.TempDir(), &fakeExec{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
 	m.retryDelay = time.Millisecond
+	m.restoreTimeout = 300 * time.Millisecond
 
 	ok, obs := restoreWithin(t, m, restoreSpec("http://127.0.0.1:1/state?X-Amz-Signature=SECRET123", strings.Repeat("0", 64), 10), t.TempDir())
 
@@ -359,7 +435,7 @@ func TestSaveStopsRunningRestoreQuietly(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer srv.Close()
-	m, _, rec := newManager(t)
+	m, rec := newManager(t)
 	m.retryDelay = time.Hour
 	root := t.TempDir()
 	spec := restoreSpec(srv.URL, strings.Repeat("0", 64), 10)
@@ -383,32 +459,6 @@ func TestSaveStopsRunningRestoreQuietly(t *testing.T) {
 	}
 }
 
-func TestFreezeRunsCommandInContainer(t *testing.T) {
-	m, exec, rec := newManager(t)
-	ranHere(t, m)
-	spec := &client.AgentStateSpec{FreezeCommand: []string{"yougpu-freeze"}, Save: &client.StateSave{UploadURL: "http://x"}}
-
-	m.Freeze(context.Background(), spec, "app_container")
-
-	if len(exec.calls) != 1 || exec.calls[0] != "docker exec app_container yougpu-freeze" {
-		t.Fatalf("calls %v", exec.calls)
-	}
-	if strings.Join(rec.states(), ",") != client.StateSaving {
-		t.Fatalf("reported %v", rec.states())
-	}
-}
-
-func TestFreezeSkippedWhenNothingWillBeSaved(t *testing.T) {
-	m, exec, rec := newManager(t)
-	spec := &client.AgentStateSpec{FreezeCommand: []string{"yougpu-freeze"}, Save: &client.StateSave{UploadURL: "http://x"}}
-
-	m.Freeze(context.Background(), spec, "app_container")
-
-	if len(exec.calls) != 0 || len(rec.states()) != 0 {
-		t.Fatalf("calls %v reports %v", exec.calls, rec.states())
-	}
-}
-
 func TestSaveUploadsArchiveOnce(t *testing.T) {
 	var puts atomic.Int32
 	var got []byte
@@ -423,7 +473,7 @@ func TestSaveUploadsArchiveOnce(t *testing.T) {
 		got, _ = io.ReadAll(r.Body)
 	}))
 	defer srv.Close()
-	m, _, rec := newManager(t)
+	m, rec := newManager(t)
 	ranHere(t, m)
 	root := t.TempDir()
 	writeFile(t, root, "user/default/tabs.json", "{}", 0o644)
@@ -457,7 +507,7 @@ func TestSaveSkipsWorkspaceThatWasNeverRestored(t *testing.T) {
 		puts.Add(1)
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	if err := os.WriteFile(m.marker(container.StartedMarker), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +532,7 @@ func TestSaveSkipsWhenComfyNeverStartedHere(t *testing.T) {
 		puts.Add(1)
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	root := t.TempDir()
 	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL}}
 	if ok, _ := m.Restore(context.Background(), spec, workspace(root)); !ok {
@@ -496,59 +546,151 @@ func TestSaveSkipsWhenComfyNeverStartedHere(t *testing.T) {
 	}
 }
 
-func TestSaveRetriesUntilDeadline(t *testing.T) {
-	var puts atomic.Int32
+func TestSaveRetriesUploadOfTheSameArchiveUntilDeadline(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		puts.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
-	m, _, rec := newManager(t)
+	puts := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(bodies)
+	}
+	m, rec := newManager(t)
+	m.retryDelay = time.Hour
 	ranHere(t, m)
 	root := t.TempDir()
+	writeFile(t, root, "user/default/tabs.json", "{}", 0o644)
 	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL}}
 
 	obs := m.Save(context.Background(), spec, workspace(root), nil)
-	if obs.ObservedState != client.StateSaving || obs.LastError == nil || !strings.Contains(*obs.LastError, "503") {
-		t.Fatalf("attempt inside the window must stay saving, got %+v", obs)
+	if obs.ObservedState != client.StateSaving || obs.LastError == nil || !strings.Contains(*obs.LastError, "503") || puts() != 1 {
+		t.Fatalf("attempt inside the window must stay saving, got %+v puts=%d", obs, puts())
 	}
 	if m.Outcome() != nil {
 		t.Fatal("no outcome while retrying")
 	}
-	obs = m.Save(context.Background(), spec, workspace(root), nil)
-	if obs.ObservedState != client.StateSaving || puts.Load() != 2*attempts {
-		t.Fatalf("next tick must retry, obs=%+v puts=%d", obs, puts.Load())
+	if !exists(m.stateDir, "state-out.tar.zst") {
+		t.Fatal("archive removed after a failed upload")
 	}
 
-	past := strconv.FormatInt(time.Now().Add(-11*time.Minute).UnixMilli(), 10)
+	obs = m.Save(context.Background(), spec, workspace(root), nil)
+	if obs.ObservedState != client.StateSaving || obs.LastError == nil || puts() != 1 {
+		t.Fatalf("next tick before the pause must wait, got %+v puts=%d", obs, puts())
+	}
+
+	writeFile(t, root, "user/default/tabs.json", strings.Repeat("changed", 100), 0o644)
+	m.nextUpload = time.Time{}
+	m.Save(context.Background(), spec, workspace(root), nil)
+	if puts() != 2 {
+		t.Fatalf("upload must be retried after the pause, puts=%d", puts())
+	}
+	mu.Lock()
+	same := bytes.Equal(bodies[0], bodies[1])
+	mu.Unlock()
+	if !same {
+		t.Fatal("workspace packed again for a retry")
+	}
+
+	past := strconv.FormatInt(time.Now().Add(-31*time.Minute).UnixMilli(), 10)
 	if err := os.WriteFile(m.marker(saveStartMarker), []byte(past), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m.saveWindow = saveWindow
 	obs = m.Save(context.Background(), spec, workspace(root), nil)
 	if obs.ObservedState != client.StateSaveFailed {
-		t.Fatalf("after the deadline the save fails, got %+v", obs)
+		t.Fatalf("after 30 minutes the save fails, got %+v", obs)
 	}
-	before := puts.Load()
-	if again := m.Save(context.Background(), spec, workspace(root), nil); again.ObservedState != client.StateSaveFailed || puts.Load() != before {
-		t.Fatalf("failed save must be repeated from the marker, got %+v puts=%d", again, puts.Load())
+	before := puts()
+	if again := m.Save(context.Background(), spec, workspace(root), nil); again.ObservedState != client.StateSaveFailed || puts() != before {
+		t.Fatalf("failed save must be repeated from the marker, got %+v puts=%d", again, puts())
 	}
 	if rec.count(client.StateSaveFailed) != 1 {
 		t.Fatalf("save_failed reported %d times: %v", rec.count(client.StateSaveFailed), rec.states())
 	}
 }
 
-func TestSaveTooLargeFailsAtOnce(t *testing.T) {
+func TestSavePauseGrowsAndWakesTheAgent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	m, _ := newManager(t)
+	m.retryDelay = 20 * time.Millisecond
+	woken := make(chan time.Time, 4)
+	m.SetNotify(func() { woken <- time.Now() })
+	ranHere(t, m)
+	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL}}
+	root := t.TempDir()
+
+	var pauses []time.Duration
+	for range 3 {
+		start := time.Now()
+		m.Save(context.Background(), spec, workspace(root), nil)
+		select {
+		case at := <-woken:
+			pauses = append(pauses, at.Sub(start))
+		case <-time.After(2 * time.Second):
+			t.Fatal("agent not woken for the next attempt")
+		}
+	}
+	if pauses[1] < 40*time.Millisecond || pauses[2] < 80*time.Millisecond {
+		t.Fatalf("pause between attempts must grow, got %v", pauses)
+	}
+}
+
+func TestSaveLimitIsTheB2ObjectLimit(t *testing.T) {
+	m := New(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if m.maxUpload != 5_000_000_000 {
+		t.Fatalf("max upload %d, B2 PutObject takes up to 5 000 000 000 bytes", m.maxUpload)
+	}
+}
+
+func TestTooLargeStateIsSavedWithoutVenv(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+	}))
+	defer srv.Close()
+	m, _ := newManager(t)
+	m.maxUpload = 4000
+	ranHere(t, m)
+	root := t.TempDir()
+	writeFile(t, root, ".venv/lib/torch.so", string(randomBytes(8000)), 0o644)
+	writeFile(t, root, "user/default/tabs.json", "{}", 0o644)
+	spec := &client.AgentStateSpec{Include: testInclude, Exclude: testExclude, Save: &client.StateSave{UploadURL: srv.URL}}
+
+	obs := m.Save(context.Background(), spec, workspace(root), nil)
+
+	if obs.ObservedState != client.StateSaved {
+		t.Fatalf("state over the limit must be saved without .venv, got %+v", obs)
+	}
+	dst := t.TempDir()
+	if err := Unpack(bytes.NewReader(got), dst, testInclude, roomy); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(dst, "user/default/tabs.json") || exists(dst, ".venv") {
+		t.Fatal("archive must keep the rest and drop .venv")
+	}
+}
+
+func TestStateTooLargeEvenWithoutVenvFailsAtOnce(t *testing.T) {
 	var puts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		puts.Add(1)
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
-	m.maxUpload = 16
+	m, _ := newManager(t)
+	m.maxUpload = 4000
 	ranHere(t, m)
 	root := t.TempDir()
-	writeFile(t, root, "user/default/tabs.json", strings.Repeat("{}", 1000), 0o644)
+	writeFile(t, root, "user/default/huge.json", string(randomBytes(8000)), 0o644)
 	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL}}
 
 	obs := m.Save(context.Background(), spec, workspace(root), nil)
@@ -564,7 +706,7 @@ func TestSaveDoesNotPackWhileContainerIsAlive(t *testing.T) {
 		puts.Add(1)
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	ranHere(t, m)
 	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL}}
 	alive := errors.New("контейнер не остановился: abc")
@@ -586,7 +728,7 @@ func TestRejectedSaveReportsOnlyTheErrorCode(t *testing.T) {
 		_, _ = w.Write([]byte("<Error><Code>AccessDenied</Code><Message>X-Amz-Credential=KEYID123</Message></Error>"))
 	}))
 	defer srv.Close()
-	m, _, _ := newManager(t)
+	m, _ := newManager(t)
 	m.saveWindow = 0
 	ranHere(t, m)
 	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL}}
@@ -600,7 +742,7 @@ func TestRejectedSaveReportsOnlyTheErrorCode(t *testing.T) {
 
 func TestSaveErrorsDoNotLeakSignedURL(t *testing.T) {
 	var logs bytes.Buffer
-	m := New(t.TempDir(), &fakeExec{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
 	m.retryDelay = time.Millisecond
 	m.saveWindow = 0
 	ranHere(t, m)
@@ -617,7 +759,7 @@ func TestSaveErrorsDoNotLeakSignedURL(t *testing.T) {
 }
 
 func TestNothingToSaveWithoutSaveSpec(t *testing.T) {
-	m, _, rec := newManager(t)
+	m, rec := newManager(t)
 	if obs := m.Save(context.Background(), &client.AgentStateSpec{Include: testInclude}, workspace(t.TempDir()), nil); obs != nil {
 		t.Fatalf("obs=%+v", obs)
 	}
@@ -634,7 +776,7 @@ func TestRetryDelayFollowsContext(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer srv.Close()
-	m, _, rec := newManager(t)
+	m, rec := newManager(t)
 	m.retryDelay = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	m.Restore(ctx, restoreSpec(srv.URL, strings.Repeat("0", 64), 10), workspace(t.TempDir()))

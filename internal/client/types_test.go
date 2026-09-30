@@ -61,3 +61,41 @@ func TestAgentStatusOmitsSetupWhenNil(t *testing.T) {
 		t.Errorf("nil setup must be omitted, got %s", raw)
 	}
 }
+
+func TestLifecycleErrorCarriesReason(t *testing.T) {
+	reason := "выгрузка кэша дисков не движется"
+	raw, err := json.Marshal(AgentStatus{Lifecycle: StatusLifecycle{ObservedState: "error", LastError: &reason}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"lifecycle":{"observed_state":"error","last_error":"выгрузка кэша дисков не движется"}`) {
+		t.Fatalf("got %s", raw)
+	}
+	raw, _ = json.Marshal(AgentStatus{Lifecycle: StatusLifecycle{ObservedState: "alive"}})
+	if strings.Contains(string(raw), "last_error") {
+		t.Fatalf("empty last_error must be omitted, got %s", raw)
+	}
+}
+
+func TestTunnelStatusIsOptional(t *testing.T) {
+	raw, _ := json.Marshal(AgentStatus{})
+	if strings.Contains(string(raw), "tunnel") {
+		t.Fatalf("status without a tunnel must not mention it, got %s", raw)
+	}
+	lost := "нет связи со шлюзом"
+	raw, _ = json.Marshal(AgentStatus{Tunnel: &AgentTunnelObserved{ObservedState: TunnelDisconnected, LastError: &lost}})
+	if !strings.Contains(string(raw), `"tunnel":{"observed_state":"disconnected","last_error":"нет связи со шлюзом"}`) {
+		t.Fatalf("got %s", raw)
+	}
+}
+
+func TestStateSpecIgnoresFreezeCommand(t *testing.T) {
+	var spec AgentStateSpec
+	if err := json.Unmarshal([]byte(`{"include":["user"],"freeze_command":["yougpu-freeze"],"pending":false}`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(spec)
+	if strings.Contains(string(raw), "freeze") {
+		t.Fatalf("freeze_command is gone from the contract, got %s", raw)
+	}
+}

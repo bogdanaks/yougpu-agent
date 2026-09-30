@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 	"github.com/bogdanaks/yougpu-agent/internal/system"
 )
 
@@ -24,6 +25,12 @@ const (
 	unzipViaPython  = `python3 -c "import zipfile; zipfile.ZipFile('/tmp/rclone.zip').extractall('/tmp')"`
 	maxLastError    = 1024
 	maxLogTail      = 4096
+	maxLastLog      = 20000
+
+	rcloneVersion = "v1.75.1"
+	rcloneSHA256  = "982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab"
+	rcloneArchive = "rclone-" + rcloneVersion + "-linux-amd64.zip"
+	rcloneBin     = "/usr/bin/rclone"
 
 	defaultNvidiaTries   = 30
 	defaultAptTries      = 3
@@ -211,14 +218,22 @@ func (m *Manager) installStorage(ctx context.Context) error {
 		return err
 	}
 	if !m.rcloneOK(ctx) {
-		if _, err := m.sh(ctx, downloadTimeout, "curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip"); err != nil {
+		if _, err := m.sh(ctx, downloadTimeout, "curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/"+rcloneVersion+"/"+rcloneArchive); err != nil {
 			return err
+		}
+		if _, err := m.sh(ctx, cmdTimeout, "echo '"+rcloneSHA256+"  /tmp/rclone.zip' | sha256sum -c -"); err != nil {
+			_, _ = m.exec.Run(ctx, cmdTimeout, "rm", "-f", "/tmp/rclone.zip")
+			return fmt.Errorf("rclone %s: контрольная сумма архива не совпала: %w", rcloneVersion, err)
 		}
 		if err := m.unzipRclone(ctx); err != nil {
 			return err
 		}
-		if _, err := m.sh(ctx, cmdTimeout, "cp /tmp/rclone-*-linux-amd64/rclone /usr/bin/ && chown root:root /usr/bin/rclone && chmod 755 /usr/bin/rclone && rm -rf /tmp/rclone.zip /tmp/rclone-*-linux-amd64"); err != nil {
+		dir := "/tmp/rclone-" + rcloneVersion + "-linux-amd64"
+		if _, err := m.sh(ctx, cmdTimeout, "cp "+dir+"/rclone "+rcloneBin+" && chown root:root "+rcloneBin+" && chmod 755 "+rcloneBin+" && rm -rf /tmp/rclone.zip "+dir); err != nil {
 			return err
+		}
+		if !m.rcloneOK(ctx) {
+			return fmt.Errorf("rclone %s не установился", rcloneVersion)
 		}
 	}
 	_, err := m.sh(ctx, cmdTimeout, "mkdir -p /root/.config/rclone")
@@ -300,8 +315,12 @@ func (m *Manager) hasGPU(ctx context.Context) bool {
 }
 
 func (m *Manager) rcloneOK(ctx context.Context) bool {
-	_, err := m.exec.Run(ctx, cmdTimeout, "rclone", "version")
-	return err == nil
+	out, err := m.exec.Run(ctx, cmdTimeout, rcloneBin, "version")
+	if err != nil {
+		return false
+	}
+	first, _, _ := strings.Cut(out, "\n")
+	return strings.TrimSpace(first) == "rclone "+rcloneVersion
 }
 
 func (m *Manager) fuseConfigured(ctx context.Context) bool {
@@ -316,8 +335,8 @@ func (m *Manager) sh(ctx context.Context, timeout time.Duration, script string) 
 }
 
 func (m *Manager) errorObserved(phase string, err error) client.AgentSetupObserved {
-	short := truncate(err.Error(), maxLastError)
-	bundle := m.diagnosticBundle(err)
+	short := fetch.Clip(err.Error(), maxLastError)
+	bundle := fetch.ClipTail(m.diagnosticBundle(err), maxLastLog)
 	return client.AgentSetupObserved{
 		ObservedState: client.SetupError,
 		Detail:        ptrStr(phase),
@@ -359,11 +378,4 @@ func ptrInt(v int) *int {
 
 func ptrStr(v string) *string {
 	return &v
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

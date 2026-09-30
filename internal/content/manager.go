@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -21,34 +20,31 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
-	"unicode/utf16"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 )
 
 const (
-	WorkspaceContainerPath = "/workspace"
-	dirPerm                = 0o777
-	filePerm               = 0o644
-	reportInterval         = 2 * time.Second
-	rangeParts             = 8
-	rangeMinSize           = 64 << 20
-	rangeAttempts          = 3
-	idleTimeout            = time.Minute
-	headerTimeout          = 2 * time.Minute
-	fetchAttempts          = 3
-	retryBase              = time.Minute
-	maxDetail              = 255
-	maxError               = 1024
-	maxItemError           = 200
-	maxSegment             = 255
-	hashBuffer             = 1 << 20
+	dirPerm        = 0o777
+	filePerm       = 0o644
+	reportInterval = 2 * time.Second
+	rangeParts     = 8
+	rangeMinSize   = 64 << 20
+	rangeAttempts  = 3
+	idleTimeout    = time.Minute
+	fetchAttempts  = 3
+	retryBase      = time.Minute
+	maxDetail      = 255
+	maxError       = 1024
+	maxItemError   = 200
+	maxSegment     = 255
+	hashBuffer     = 1 << 20
 )
 
 type Manager struct {
@@ -99,7 +95,7 @@ func isPermanent(err error) bool {
 
 func New(logger *slog.Logger) *Manager {
 	return &Manager{
-		httpClient: NewHTTPClient(),
+		httpClient: fetch.NewHTTPClient(),
 		logger:     logger,
 		rangeMin:   rangeMinSize,
 		idle:       idleTimeout,
@@ -107,12 +103,6 @@ func New(logger *slog.Logger) *Manager {
 		verified:   map[string]stamp{},
 		failures:   map[string]*failure{},
 	}
-}
-
-func NewHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = headerTimeout
-	return &http.Client{Transport: transport}
 }
 
 func (m *Manager) SetRangeMinForTest(n int64) {
@@ -144,20 +134,8 @@ type task struct {
 	repo   *client.ContentRepo
 }
 
-func WorkspaceRoot(spec *client.AgentContainerSpec) string {
-	if spec == nil {
-		return ""
-	}
-	for _, v := range spec.Volumes {
-		if v.Container == WorkspaceContainerPath && v.Host != "" {
-			return v.Host
-		}
-	}
-	return ""
-}
-
 func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContentSpec, container *client.AgentContainerSpec) {
-	root := WorkspaceRoot(container)
+	root := fetch.WorkspaceRoot(container)
 	key := specKey(spec, root)
 
 	m.mu.Lock()
@@ -260,7 +238,7 @@ func (m *Manager) pass(ctx context.Context, spec *client.AgentContentSpec, root 
 	var failed []string
 	for _, d := range spec.Dirs {
 		if err := mkdirAll(ws, cleanDir(d)); err != nil {
-			failed = append(failed, fmt.Sprintf("mkdir %s: %s", d, Clip(err.Error(), maxItemError)))
+			failed = append(failed, fmt.Sprintf("mkdir %s: %s", d, fetch.Clip(err.Error(), maxItemError)))
 		}
 	}
 
@@ -307,7 +285,7 @@ func (m *Manager) pass(ctx context.Context, spec *client.AgentContentSpec, root 
 			failed = append(failed, skip[i].msg)
 			continue
 		}
-		detail := Clip(t.label, maxDetail)
+		detail := fetch.Clip(t.label, maxDetail)
 		m.report(ctx, client.ContentDownloading, ptr(clamp(idx*100/queued)), &detail)
 		current := idx
 		onProgress := func(fraction float64) {
@@ -320,7 +298,7 @@ func (m *Manager) pass(ctx context.Context, spec *client.AgentContentSpec, root 
 			return errObs("cancelled"), false
 		}
 		if err != nil {
-			msg := fmt.Sprintf("%s: %s", t.label, Clip(err.Error(), maxItemError))
+			msg := fmt.Sprintf("%s: %s", t.label, fetch.Clip(err.Error(), maxItemError))
 			m.logger.Error("content fetch failed", "label", t.label, "err", err)
 			m.fail(t.target, msg, isPermanent(err))
 			failed = append(failed, msg)
@@ -369,7 +347,7 @@ func (m *Manager) plan(ctx context.Context, ws *os.Root, spec *client.AgentConte
 		}
 		rel := path.Join(cleanDir(f.Dest), name)
 		if err := checkRel(rel); err != nil {
-			invalid = append(invalid, fmt.Sprintf("%q: %s", Clip(name, maxItemError), err))
+			invalid = append(invalid, fmt.Sprintf("%q: %s", fetch.Clip(name, maxItemError), err))
 			continue
 		}
 		if regularFile(ws, rel) {
@@ -378,13 +356,6 @@ func (m *Manager) plan(ctx context.Context, ws *os.Root, spec *client.AgentConte
 		tasks = append(tasks, newTask(root, rel, f.URL, name, "", 0, f.Content))
 	}
 
-	type group struct {
-		model    client.ContentModel
-		label    string
-		conflict bool
-	}
-	var order []string
-	groups := map[string]*group{}
 	for _, mdl := range spec.Models {
 		name := mdl.Name
 		if name == "" {
@@ -395,34 +366,11 @@ func (m *Manager) plan(ctx context.Context, ws *os.Root, spec *client.AgentConte
 			continue
 		}
 		if err := checkModel(mdl.Type, name); err != nil {
-			invalid = append(invalid, fmt.Sprintf("%q: %s", Clip(name, maxItemError), err))
+			invalid = append(invalid, fmt.Sprintf("%q: %s", fetch.Clip(name, maxItemError), err))
 			continue
 		}
 		rel := path.Join("models", mdl.Type, name)
-		g, ok := groups[rel]
-		if !ok {
-			mdl.Name = name
-			groups[rel] = &group{model: mdl, label: name}
-			order = append(order, rel)
-			continue
-		}
-		switch {
-		case mdl.SHA256 != "" && g.model.SHA256 != "" && !strings.EqualFold(mdl.SHA256, g.model.SHA256):
-			g.conflict = true
-		case g.model.SHA256 == "" && mdl.SHA256 != "":
-			g.model.SHA256 = mdl.SHA256
-		}
-		if g.model.SizeBytes == 0 {
-			g.model.SizeBytes = mdl.SizeBytes
-		}
-	}
-	for _, rel := range order {
-		g := groups[rel]
-		if g.conflict {
-			invalid = append(invalid, fmt.Sprintf("%s: conflicting sha256 for %s", g.label, rel))
-			continue
-		}
-		t := newTask(root, rel, g.model.URL, g.label, g.model.SHA256, g.model.SizeBytes, "")
+		t := newTask(root, rel, mdl.URL, name, mdl.SHA256, mdl.SizeBytes, "")
 		t.model = true
 		if m.modelPresent(ctx, ws, rel, t) {
 			continue
@@ -499,7 +447,7 @@ func checkRel(p string) error {
 
 func (m *Manager) modelPresent(ctx context.Context, ws *os.Root, rel string, t task) bool {
 	info, err := ws.Stat(filepath.FromSlash(rel))
-	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
 	if t.size > 0 && info.Size() != t.size {
@@ -608,7 +556,7 @@ func (m *Manager) fill(ctx context.Context, f *os.File, t task, onProgress func(
 }
 
 func (m *Manager) download(ctx context.Context, t task, f *os.File, onProgress func(float64)) error {
-	resp, err := Get(ctx, m.httpClient, t.url, "bytes=0-", m.idle)
+	resp, err := fetch.Get(ctx, m.httpClient, t.url, "bytes=0-", m.idle)
 	if err != nil {
 		return err
 	}
@@ -745,7 +693,7 @@ func (m *Manager) downloadPart(ctx context.Context, rawURL string, out *os.File,
 }
 
 func (m *Manager) downloadRange(ctx context.Context, rawURL string, out *os.File, from, to int64, pw *progressWriter) (int64, error) {
-	resp, err := Get(ctx, m.httpClient, rawURL, fmt.Sprintf("bytes=%d-%d", from, to), m.idle)
+	resp, err := fetch.Get(ctx, m.httpClient, rawURL, fmt.Sprintf("bytes=%d-%d", from, to), m.idle)
 	if err != nil {
 		return 0, err
 	}
@@ -756,81 +704,6 @@ func (m *Manager) downloadRange(ctx context.Context, rawURL string, out *os.File
 	return io.Copy(io.MultiWriter(io.NewOffsetWriter(out, from), pw), resp.Body)
 }
 
-func Get(ctx context.Context, c *http.Client, rawURL, rng string, idle time.Duration) (*http.Response, error) {
-	reqCtx, watch := newIdleWatch(ctx, idle)
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		watch.stop()
-		return nil, Redact(err)
-	}
-	if rng != "" {
-		req.Header.Set("Range", rng)
-	}
-	resp, err := c.Do(req)
-	if err != nil {
-		watch.stop()
-		return nil, Redact(watch.explain(err))
-	}
-	resp.Body = &idleBody{ReadCloser: resp.Body, watch: watch}
-	return resp, nil
-}
-
-func Redact(err error) error {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
-	}
-	return err
-}
-
-type idleWatch struct {
-	idle   time.Duration
-	cancel context.CancelFunc
-	timer  *time.Timer
-	fired  atomic.Bool
-}
-
-func newIdleWatch(ctx context.Context, idle time.Duration) (context.Context, *idleWatch) {
-	reqCtx, cancel := context.WithCancel(ctx)
-	w := &idleWatch{idle: idle, cancel: cancel}
-	w.timer = time.AfterFunc(idle, func() {
-		w.fired.Store(true)
-		cancel()
-	})
-	return reqCtx, w
-}
-
-func (w *idleWatch) explain(err error) error {
-	if err != nil && !errors.Is(err, io.EOF) && w.fired.Load() {
-		return fmt.Errorf("no data for %s", w.idle)
-	}
-	return err
-}
-
-func (w *idleWatch) stop() {
-	w.timer.Stop()
-	w.cancel()
-}
-
-type idleBody struct {
-	io.ReadCloser
-	watch *idleWatch
-}
-
-func (b *idleBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if n > 0 {
-		b.watch.timer.Reset(b.watch.idle)
-	}
-	return n, b.watch.explain(err)
-}
-
-func (b *idleBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.watch.stop()
-	return err
-}
-
 func (m *Manager) clone(ctx context.Context, t task) error {
 	if err := os.MkdirAll(filepath.Dir(t.target), dirPerm); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
@@ -839,10 +712,10 @@ func (m *Manager) clone(ctx context.Context, t task) error {
 	if t.repo.Ref != "" {
 		args = append(args, "--branch", t.repo.Ref)
 	}
-	args = append(args, t.repo.URL, t.target)
+	args = append(args, "--", t.repo.URL, t.target)
 	if out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput(); err != nil {
 		os.RemoveAll(t.target)
-		return fmt.Errorf("git clone: %w: %s", err, Clip(strings.TrimSpace(string(out)), maxItemError))
+		return fmt.Errorf("git clone: %w: %s", err, fetch.Clip(strings.TrimSpace(string(out)), maxItemError))
 	}
 	return nil
 }
@@ -895,7 +768,7 @@ func ready() client.AgentContentObserved {
 }
 
 func errObs(msg string) client.AgentContentObserved {
-	e := Clip(msg, maxError)
+	e := fetch.Clip(msg, maxError)
 	return client.AgentContentObserved{ObservedState: client.ContentError, LastError: &e}
 }
 
@@ -938,25 +811,9 @@ func partName(base string) string {
 	return ".yougpu-" + hex.EncodeToString(sum[:8]) + ".part"
 }
 
-type ctxReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (c ctxReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return c.r.Read(p)
-}
-
-func CtxReader(ctx context.Context, r io.Reader) io.Reader {
-	return ctxReader{ctx: ctx, r: r}
-}
-
 func hashReader(ctx context.Context, r io.Reader) (string, error) {
 	h := sha256.New()
-	if _, err := io.CopyBuffer(h, CtxReader(ctx, r), make([]byte, hashBuffer)); err != nil {
+	if _, err := io.CopyBuffer(h, fetch.CtxReader(ctx, r), make([]byte, hashBuffer)); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -982,19 +839,4 @@ func clamp(i int) int {
 		return 100
 	}
 	return i
-}
-
-func Clip(s string, n int) string {
-	units := 0
-	for i, r := range s {
-		w := utf16.RuneLen(r)
-		if w < 0 {
-			w = 1
-		}
-		if units+w > n {
-			return s[:i]
-		}
-		units += w
-	}
-	return s
 }

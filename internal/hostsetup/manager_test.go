@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 	"github.com/bogdanaks/yougpu-agent/internal/system"
@@ -24,6 +25,7 @@ type fakeExec struct {
 	gpu            bool
 	dockerUp       bool
 	rcloneOK       bool
+	rcloneOld      bool
 	fuseOK         bool
 	aptConfPresent bool
 	nvidiaRuntime  []bool
@@ -31,6 +33,7 @@ type fakeExec struct {
 	failContains   string
 	failTimes      int
 	failSeen       int
+	failOutput     string
 }
 
 func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
@@ -91,9 +94,12 @@ func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...
 		}
 		return "", errors.New("cannot connect to docker daemon")
 
-	case name == "rclone" && len(args) >= 1 && args[0] == "version":
+	case (name == "rclone" || name == "/usr/bin/rclone") && len(args) >= 1 && args[0] == "version":
 		if f.rcloneOK {
-			return "rclone v1.66", nil
+			return "rclone " + rcloneVersion + "\n- os/version: ubuntu 24.04 (64 bit)\n", nil
+		}
+		if f.rcloneOld {
+			return "rclone v1.60.1-DEV\n- os/version: ubuntu 24.04 (64 bit)\n", nil
 		}
 		return "", errors.New("rclone not installed")
 	}
@@ -101,8 +107,15 @@ func (f *fakeExec) Run(_ context.Context, _ time.Duration, name string, args ...
 	if f.failContains != "" && script != "" && strings.Contains(script, f.failContains) {
 		if f.failTimes == 0 || f.failSeen < f.failTimes {
 			f.failSeen++
-			return "partial stdout before failure", errors.New("exit status 1 (stderr: boom)")
+			out := "partial stdout before failure"
+			if f.failOutput != "" {
+				out = f.failOutput
+			}
+			return out, errors.New("exit status 1 (stderr: boom)")
 		}
+	}
+	if strings.HasPrefix(script, "cp /tmp/rclone-"+rcloneVersion+"-linux-amd64/rclone ") {
+		f.rcloneOK = true
 	}
 	return "", nil
 }
@@ -133,7 +146,7 @@ func TestReconcileReadyHostIsNoop(t *testing.T) {
 	}
 	for _, c := range calls {
 		if strings.Contains(c, "apt-get -o DPkg::Lock::Timeout") || strings.Contains(c, "get.docker.com") ||
-			strings.Contains(c, "nvidia-ctk runtime configure") || strings.Contains(c, "rclone-current") {
+			strings.Contains(c, "nvidia-ctk runtime configure") || strings.Contains(c, rcloneArchive) {
 			t.Errorf("ready host must not mutate, got call: %s", c)
 		}
 	}
@@ -157,7 +170,7 @@ func TestReconcileFreshHostRunsAllStepsInOrder(t *testing.T) {
 	j := joined(calls)
 	dockerAt := strings.Index(j, "get.docker.com")
 	nvidiaAt := strings.Index(j, "nvidia-ctk runtime configure")
-	rcloneAt := strings.Index(j, "rclone-current")
+	rcloneAt := strings.Index(j, rcloneArchive)
 	if dockerAt < 0 || nvidiaAt < 0 || rcloneAt < 0 {
 		t.Fatalf("all steps must run, calls: %s", j)
 	}
@@ -326,7 +339,7 @@ func TestReconcileStockImageNeedsNoApt(t *testing.T) {
 	if strings.Contains(j, "apt-get") {
 		t.Errorf("stock image must not touch apt at all, calls: %s", j)
 	}
-	if !strings.Contains(j, "rclone-current") || !strings.Contains(j, "zipfile") {
+	if !strings.Contains(j, rcloneArchive) || !strings.Contains(j, "zipfile") {
 		t.Errorf("rclone must be fetched and unpacked without unzip, calls: %s", j)
 	}
 }
@@ -473,5 +486,66 @@ func TestReconcileProgressMonotonic(t *testing.T) {
 		if progresses[i] < progresses[i-1] {
 			t.Errorf("progress must be monotonic, got %v", progresses)
 		}
+	}
+}
+
+func TestReconcileReplacesRcloneOfAnotherVersion(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "fusermount3": true},
+		dockerUp:       true,
+		rcloneOld:      true,
+		fuseOK:         true,
+		aptConfPresent: true,
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("want ready, got %s (err %v)", obs.ObservedState, obs.LastError)
+	}
+	j := joined(calls)
+	if !strings.Contains(j, "https://downloads.rclone.org/"+rcloneVersion+"/"+rcloneArchive) {
+		t.Fatalf("rclone of another version must be replaced by the pinned release, calls: %s", j)
+	}
+	if !strings.Contains(j, rcloneSHA256+"  /tmp/rclone.zip") {
+		t.Fatalf("pinned release must be verified by sha256, calls: %s", j)
+	}
+}
+
+func TestReconcileRefusesRcloneWithWrongChecksum(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "fusermount3": true},
+		dockerUp:       true,
+		fuseOK:         true,
+		aptConfPresent: true,
+		failContains:   "sha256sum",
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.ObservedState != client.SetupError {
+		t.Fatalf("checksum mismatch must fail the setup, got %s", obs.ObservedState)
+	}
+	if strings.Contains(joined(calls), "/usr/bin/") && strings.Contains(joined(calls), "cp ") {
+		t.Fatalf("unverified rclone must not be installed, calls: %s", joined(calls))
+	}
+}
+
+func TestSetupLogKeepsTailWithinBackendLimit(t *testing.T) {
+	fe := &fakeExec{
+		present:      map[string]bool{"lspci": true},
+		dockerUp:     true,
+		failContains: "install -y gnupg",
+		failOutput:   strings.Repeat("я", 30000) + "last line of apt",
+	}
+	obs := newManager(fe).Reconcile(context.Background())
+	if obs.LastLog == nil {
+		t.Fatal("want last_log")
+	}
+	if n := len(utf16.Encode([]rune(*obs.LastLog))); n > 20000 {
+		t.Fatalf("last_log is %d UTF-16 units, backend accepts 20000", n)
+	}
+	if !strings.Contains(*obs.LastLog, "exit status 1") {
+		t.Fatalf("tail with the error must be kept, got ...%s", (*obs.LastLog)[len(*obs.LastLog)-200:])
 	}
 }

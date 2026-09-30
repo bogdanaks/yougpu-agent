@@ -79,9 +79,9 @@ func TestRunArgsContainsCoreFlags(t *testing.T) {
 	args := m.runArgs(sampleSpec(), "deadbeef")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
-		"run -d", "--name app_container", "--restart unless-stopped", "--network host",
+		"run -d", "--name app_container", "--init", "--restart unless-stopped", "--network host",
 		"--label yougpu.managed=true", "--label yougpu.spec.hash=deadbeef",
-		"--gpus all", "--shm-size=8g", "-v /data:/workspace:rw",
+		"--gpus all", "--shm-size=8g", "-v /data:/workspace:rw,rslave ",
 		"-e A=1", "-e B=2", "pytorch/pytorch:latest",
 	} {
 		if !strings.Contains(joined, want) {
@@ -345,5 +345,18 @@ func TestFailedRunLeavesNoStartedMarker(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(dir, StartedMarker)); err == nil {
 		t.Fatal("marker written after a failed docker run")
+	}
+}
+
+func TestRestartKeepsTheSameContainer(t *testing.T) {
+	var calls []string
+	m := NewManager(scriptExec{t: t, inspect: "true|x", runCalls: &calls}, &fakePuller{}, "", testLogger())
+
+	if err := m.Restart(context.Background()); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if len(calls) != 1 || !strings.HasPrefix(calls[0], "docker restart ") || !strings.HasSuffix(calls[0], " app_container") {
+		t.Fatalf("want a single docker restart of app_container, got %v", calls)
 	}
 }

@@ -15,12 +15,11 @@ type AgentSpec struct {
 }
 
 type AgentStateSpec struct {
-	Include       []string      `json:"include"`
-	Exclude       []string      `json:"exclude"`
-	FreezeCommand []string      `json:"freeze_command"`
-	Pending       bool          `json:"pending"`
-	Restore       *StateRestore `json:"restore"`
-	Save          *StateSave    `json:"save"`
+	Include []string      `json:"include"`
+	Exclude []string      `json:"exclude"`
+	Pending bool          `json:"pending"`
+	Restore *StateRestore `json:"restore"`
+	Save    *StateSave    `json:"save"`
 }
 
 type StateRestore struct {
@@ -127,12 +126,14 @@ type AgentStatus struct {
 	Setup              *AgentSetupObserved     `json:"setup,omitempty"`
 	Content            *AgentContentObserved   `json:"content,omitempty"`
 	State              *AgentStateObserved     `json:"state,omitempty"`
+	Tunnel             *AgentTunnelObserved    `json:"tunnel,omitempty"`
 	AgentVersion       string                  `json:"agent_version,omitempty"`
 	UptimeSec          int64                   `json:"uptime_sec,omitempty"`
 }
 
 type StatusLifecycle struct {
-	ObservedState string `json:"observed_state"`
+	ObservedState string  `json:"observed_state"`
+	LastError     *string `json:"last_error,omitempty"`
 }
 
 type AgentDiskObserved struct {
@@ -166,6 +167,11 @@ type AgentStateObserved struct {
 	ObservedState string  `json:"observed_state"`
 	SHA256        *string `json:"sha256,omitempty"`
 	SizeBytes     *int64  `json:"size_bytes,omitempty"`
+	LastError     *string `json:"last_error,omitempty"`
+}
+
+type AgentTunnelObserved struct {
+	ObservedState string  `json:"observed_state"`
 	LastError     *string `json:"last_error,omitempty"`
 }
 
@@ -207,6 +213,9 @@ const (
 	StateSaveSkipped   = "save_skipped"
 	StateSaveFailed    = "save_failed"
 
+	TunnelConnected    = "connected"
+	TunnelDisconnected = "disconnected"
+
 	ContentDownloading = "downloading"
 	ContentReady       = "ready"
 	ContentError       = "error"
@@ -218,11 +227,4 @@ type StorageCredentials struct {
 	SecretKey    string    `json:"secretKey"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 	CredentialID string    `json:"credentialId"`
-}
-
-type ProvisioningStatusRequest struct {
-	Status    string  `json:"status"`
-	Message   *string `json:"message,omitempty"`
-	IPAddress *string `json:"ip_address,omitempty"`
-	LogBase64 *string `json:"log_base64,omitempty"`
 }

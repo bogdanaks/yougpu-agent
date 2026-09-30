@@ -111,7 +111,7 @@ func writeEntry(tw *tar.Writer, p, rel string, d fs.DirEntry, count *counter) er
 	if err != nil {
 		return err
 	}
-	h := &tar.Header{Name: rel, Mode: int64(info.Mode().Perm()), ModTime: info.ModTime()}
+	h := &tar.Header{Name: rel, Mode: int64(info.Mode().Perm()), ModTime: info.ModTime(), Format: tar.FormatPAX}
 	switch {
 	case d.IsDir():
 		h.Typeflag = tar.TypeDir

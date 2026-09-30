@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 	"github.com/bogdanaks/yougpu-agent/internal/system"
 )
 
@@ -18,6 +19,7 @@ const (
 	sshProto      = "tcp"
 	yougpuComment = "yougpu"
 	ufwTimeout    = 10 * time.Second
+	maxError      = 1024
 )
 
 var ruleRe = regexp.MustCompile(`(?m)^(\d+)/(tcp|udp)\b.*#\s*yougpu\b`)
@@ -125,7 +127,7 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentFirewallSpec)
 	}
 
 	if len(errs) > 0 {
-		msg := truncate(strings.Join(errs, "; "), 1024)
+		msg := fetch.Clip(strings.Join(errs, "; "), maxError)
 		return client.AgentFirewallObserved{ObservedState: client.FirewallError, LastError: &msg}
 	}
 	return client.AgentFirewallObserved{ObservedState: client.FirewallApplied}
@@ -146,13 +148,6 @@ func (m *Manager) delete(ctx context.Context, p Port) error {
 }
 
 func (m *Manager) errReport(err error) client.AgentFirewallObserved {
-	msg := truncate(err.Error(), 1024)
+	msg := fetch.Clip(err.Error(), maxError)
 	return client.AgentFirewallObserved{ObservedState: client.FirewallError, LastError: &msg}
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +20,7 @@ import (
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 	"github.com/bogdanaks/yougpu-agent/internal/container"
-	"github.com/bogdanaks/yougpu-agent/internal/content"
-	"github.com/bogdanaks/yougpu-agent/internal/system"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 )
 
 const (
@@ -32,13 +32,16 @@ const (
 	restoreDir      = ".yougpu-restore"
 	maxUnpacked     = 20 << 30
 	maxEntries      = 500_000
-	maxUpload       = 5 << 30
+	packedMarker    = "state_packed"
+	inArchive       = "state-in.tar.zst"
+	outArchive      = "state-out.tar.zst"
+	venvDir         = ".venv"
+	maxUpload       = 5_000_000_000
 	maxError        = 1024
-	attempts        = 3
-	freezeTimeout   = 2 * time.Minute
 	restoreTimeout  = 30 * time.Minute
 	saveTimeout     = 30 * time.Minute
-	saveWindow      = 10 * time.Minute
+	saveWindow      = 30 * time.Minute
+	maxRetryDelay   = 2 * time.Minute
 	idleTimeout     = time.Minute
 	restoringEvery  = 30 * time.Second
 	retryDelay      = 5 * time.Second
@@ -46,7 +49,6 @@ const (
 
 type Manager struct {
 	stateDir       string
-	exec           system.Executor
 	http           *http.Client
 	log            *slog.Logger
 	reporter       func(context.Context, client.AgentStateObserved)
@@ -59,6 +61,9 @@ type Manager struct {
 	restoringEvery time.Duration
 	limits         Limits
 	maxUpload      int64
+	uploadFails    int
+	uploadErr      error
+	nextUpload     time.Time
 
 	mu  sync.Mutex
 	job *restoreJob
@@ -78,11 +83,10 @@ type finalError struct{ err error }
 func (e finalError) Error() string { return e.err.Error() }
 func (e finalError) Unwrap() error { return e.err }
 
-func New(stateDir string, exec system.Executor, log *slog.Logger) *Manager {
+func New(stateDir string, log *slog.Logger) *Manager {
 	return &Manager{
 		stateDir:       stateDir,
-		exec:           exec,
-		http:           content.NewHTTPClient(),
+		http:           fetch.NewHTTPClient(),
 		log:            log,
 		retryDelay:     retryDelay,
 		idle:           idleTimeout,
@@ -135,7 +139,7 @@ func (m *Manager) Restore(ctx context.Context, spec *client.AgentStateSpec, cont
 		}
 		return true, &client.AgentStateObserved{ObservedState: client.StateRestored}
 	}
-	root := content.WorkspaceRoot(container)
+	root := fetch.WorkspaceRoot(container)
 	if root == "" {
 		return false, m.failed(ctx, client.StateRestoreFailed, errors.New("no /workspace volume to restore state into"))
 	}
@@ -176,9 +180,6 @@ func (m *Manager) runRestore(parent, ctx context.Context, j *restoreJob, spec *c
 	stopReports()
 	if j.stopped.Load() || parent.Err() != nil {
 		return
-	}
-	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		err = fmt.Errorf("state restore did not finish in %s", m.restoreTimeout)
 	}
 	if err == nil {
 		err = os.WriteFile(m.marker(restoredMarker), []byte(spec.Restore.SHA256), 0o644)
@@ -234,20 +235,16 @@ func (m *Manager) restore(ctx context.Context, spec *client.AgentStateSpec, root
 	if err := os.MkdirAll(root, 0o777); err != nil {
 		return err
 	}
-	archive := m.marker("state-in.tar.zst")
+	archive := m.marker(inArchive)
+	if err := os.Remove(archive); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	defer os.Remove(archive)
-	for attempt := 1; ; attempt++ {
-		err := m.download(ctx, spec.Restore, archive)
-		if err == nil {
-			break
-		}
-		m.log.Warn("state download failed", "attempt", attempt, "err", err)
-		if ctx.Err() != nil || attempt == attempts {
-			return err
-		}
-		if err := sleep(ctx, m.retryDelay); err != nil {
-			return err
-		}
+	if err := m.fetchArchive(ctx, spec.Restore, archive); err != nil {
+		return err
+	}
+	if err := verify(ctx, archive, spec.Restore.SHA256); err != nil {
+		return err
 	}
 	f, err := os.Open(archive)
 	if err != nil {
@@ -262,42 +259,131 @@ func (m *Manager) restore(ctx context.Context, spec *client.AgentStateSpec, root
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := Unpack(content.CtxReader(ctx, f), tmp, spec.Include, m.limits); err != nil {
-		return err
+	if err := Unpack(fetch.CtxReader(ctx, f), tmp, spec.Include, m.limits); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("state unpack: did not finish in %s", m.restoreTimeout)
+		}
+		return fmt.Errorf("state unpack: %w", err)
 	}
 	return moveInto(tmp, root)
 }
 
-func (m *Manager) download(ctx context.Context, spec *client.StateRestore, dest string) (err error) {
-	defer func() {
-		if err != nil {
-			os.Remove(dest)
+func (m *Manager) fetchArchive(ctx context.Context, spec *client.StateRestore, dest string) error {
+	delay := m.retryDelay
+	var cause error
+	for attempt := 1; ; attempt++ {
+		err := m.download(ctx, spec, dest)
+		if err == nil {
+			return nil
 		}
-	}()
-	resp, err := content.Get(ctx, m.http, spec.URL, "", m.idle)
+		if ctx.Err() == nil || cause == nil {
+			cause = err
+		}
+		var final finalError
+		if errors.As(err, &final) {
+			return fmt.Errorf("state download: %w", err)
+		}
+		if ctx.Err() == nil {
+			m.log.Warn("state download failed, retrying", "attempt", attempt, "pause", delay.String(), "err", err)
+			if sleep(ctx, delay) == nil {
+				delay = min(delay*2, maxRetryDelay)
+				continue
+			}
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("state download: did not finish in %s: %w", m.restoreTimeout, cause)
+		}
+		return fmt.Errorf("state download: %w", cause)
+	}
+}
+
+func (m *Manager) download(ctx context.Context, spec *client.StateRestore, dest string) error {
+	f, err := os.OpenFile(dest, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	have, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if have > spec.SizeBytes {
+		if have, err = restart(f); err != nil {
+			return err
+		}
+	}
+	if have == spec.SizeBytes {
+		return nil
+	}
+	rng := ""
+	if have > 0 {
+		rng = fmt.Sprintf("bytes=%d-", have)
+	}
+	resp, err := fetch.Get(ctx, m.http, spec.URL, rng, m.idle)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("state download: http %d", resp.StatusCode)
+	switch code := resp.StatusCode; {
+	case code == http.StatusPartialContent && have > 0 && rangeStart(resp.Header.Get("Content-Range")) == have:
+	case code == http.StatusOK:
+		if have, err = restart(f); err != nil {
+			return err
+		}
+	case code == http.StatusPartialContent || code == http.StatusRequestedRangeNotSatisfiable:
+		_, _ = restart(f)
+		return fmt.Errorf("http %d for bytes from %d", code, have)
+	case code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests:
+		return finalError{fmt.Errorf("http %d", code)}
+	default:
+		return fmt.Errorf("http %d", code)
 	}
-	f, err := os.Create(dest)
+	n, err := io.Copy(f, io.LimitReader(resp.Body, spec.SizeBytes-have+1))
+	have += n
 	if err != nil {
 		return err
 	}
+	if have > spec.SizeBytes {
+		_, _ = restart(f)
+		return finalError{fmt.Errorf("archive is larger than %d bytes", spec.SizeBytes)}
+	}
+	if have < spec.SizeBytes {
+		return fmt.Errorf("got %d of %d bytes", have, spec.SizeBytes)
+	}
+	return nil
+}
+
+func restart(f *os.File) (int64, error) {
+	if err := f.Truncate(0); err != nil {
+		return 0, err
+	}
+	return f.Seek(0, io.SeekStart)
+}
+
+func rangeStart(contentRange string) int64 {
+	spec, ok := strings.CutPrefix(contentRange, "bytes ")
+	if !ok {
+		return -1
+	}
+	from, _, _ := strings.Cut(spec, "-")
+	n, err := strconv.ParseInt(from, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func verify(ctx context.Context, path, want string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, spec.SizeBytes+1))
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
+	if _, err := io.Copy(h, fetch.CtxReader(ctx, f)); err != nil {
 		return err
 	}
-	if n != spec.SizeBytes {
-		return fmt.Errorf("state size %d, expected %d", n, spec.SizeBytes)
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != spec.SHA256 {
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
 		return fmt.Errorf("state sha256 mismatch: %s", got)
 	}
 	return nil
@@ -305,24 +391,6 @@ func (m *Manager) download(ctx context.Context, spec *client.StateRestore, dest 
 
 func (m *Manager) packable() bool {
 	return m.has(restoredMarker) && m.has(container.StartedMarker)
-}
-
-func (m *Manager) Freeze(ctx context.Context, spec *client.AgentStateSpec, containerName string) {
-	if spec == nil || spec.Save == nil {
-		return
-	}
-	m.stopRestore()
-	if m.Outcome() != nil || !m.packable() {
-		return
-	}
-	m.report(ctx, client.AgentStateObserved{ObservedState: client.StateSaving})
-	if len(spec.FreezeCommand) == 0 {
-		return
-	}
-	args := append([]string{"exec", containerName}, spec.FreezeCommand...)
-	if _, err := m.exec.Run(ctx, freezeTimeout, "docker", args...); err != nil {
-		m.log.Warn("state freeze command failed", "err", err)
-	}
 }
 
 func (m *Manager) Outcome() *client.AgentStateObserved {
@@ -360,9 +428,12 @@ func (m *Manager) Save(ctx context.Context, spec *client.AgentStateSpec, contain
 	if stopErr != nil {
 		return m.saveFailed(ctx, started, stopErr)
 	}
-	root := content.WorkspaceRoot(container)
+	root := fetch.WorkspaceRoot(container)
 	if root == "" {
 		return m.saveFailed(ctx, started, finalError{errors.New("no /workspace volume to save state from")})
+	}
+	if m.uploadErr != nil && time.Now().Before(m.nextUpload) {
+		return m.saveFailed(ctx, started, m.uploadErr)
 	}
 	m.report(ctx, client.AgentStateObserved{ObservedState: client.StateSaving})
 	sum, size, err := m.save(ctx, spec, root)
@@ -392,13 +463,14 @@ func (m *Manager) saveStarted() time.Time {
 func (m *Manager) saveFailed(ctx context.Context, started time.Time, err error) *client.AgentStateObserved {
 	var final finalError
 	if errors.As(err, &final) || errors.Is(err, errTooLarge) || time.Since(started) >= m.saveWindow {
+		m.dropArchive()
 		obs := m.failed(ctx, client.StateSaveFailed, err)
 		if werr := os.WriteFile(m.marker(failedMarker), []byte(*obs.LastError), 0o644); werr != nil {
 			m.log.Warn("could not persist failed save", "err", werr)
 		}
 		return obs
 	}
-	msg := content.Clip(content.Redact(err).Error(), maxError)
+	msg := fetch.Clip(fetch.Redact(err).Error(), maxError)
 	m.log.Warn("workspace state save attempt failed, retrying on next tick", "err", msg, "until", started.Add(m.saveWindow))
 	return m.report(ctx, client.AgentStateObserved{ObservedState: client.StateSaving, LastError: &msg})
 }
@@ -406,35 +478,88 @@ func (m *Manager) saveFailed(ctx context.Context, started time.Time, err error) 
 func (m *Manager) save(ctx context.Context, spec *client.AgentStateSpec, root string) (string, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, m.saveTimeout)
 	defer cancel()
-	archive := m.marker("state-out.tar.zst")
-	defer os.Remove(archive)
-	sum, size, err := m.packToFile(ctx, root, spec, archive)
+	archive := m.marker(outArchive)
+	sum, size, err := m.packed(archive)
+	if err != nil {
+		if sum, size, err = m.pack(ctx, spec, root, archive); err != nil {
+			return "", 0, err
+		}
+	}
+	if err := m.upload(ctx, spec.Save.UploadURL, archive, size); err != nil {
+		m.retryLater(err)
+		return "", 0, err
+	}
+	m.dropArchive()
+	return sum, size, nil
+}
+
+func (m *Manager) retryLater(err error) {
+	delay := m.retryDelay
+	for i := 0; i < m.uploadFails && delay < maxRetryDelay; i++ {
+		delay *= 2
+	}
+	delay = min(delay, maxRetryDelay)
+	m.uploadFails++
+	m.uploadErr = err
+	m.nextUpload = time.Now().Add(delay)
+	m.log.Warn("state upload failed, will retry", "attempt", m.uploadFails, "pause", delay.String(), "err", err)
+	if m.notify != nil {
+		time.AfterFunc(delay, m.notify)
+	}
+}
+
+func (m *Manager) packed(archive string) (string, int64, error) {
+	raw, err := os.ReadFile(m.marker(packedMarker))
 	if err != nil {
 		return "", 0, err
 	}
-	for attempt := 1; ; attempt++ {
-		err = m.upload(ctx, spec.Save.UploadURL, archive, size)
-		if err == nil {
-			return sum, size, nil
-		}
-		m.log.Warn("state upload failed", "attempt", attempt, "err", err)
-		if ctx.Err() != nil || attempt == attempts {
-			return "", 0, err
-		}
-		if err := sleep(ctx, m.retryDelay); err != nil {
-			return "", 0, err
+	sum, sizeText, _ := strings.Cut(strings.TrimSpace(string(raw)), " ")
+	size, err := strconv.ParseInt(sizeText, 10, 64)
+	if err != nil {
+		return "", 0, err
+	}
+	info, err := os.Stat(archive)
+	if err != nil {
+		return "", 0, err
+	}
+	if info.Size() != size {
+		return "", 0, fmt.Errorf("packed archive is %d bytes, expected %d", info.Size(), size)
+	}
+	return sum, size, nil
+}
+
+func (m *Manager) pack(ctx context.Context, spec *client.AgentStateSpec, root, archive string) (string, int64, error) {
+	sum, size, err := m.packToFile(ctx, root, spec.Include, spec.Exclude, archive)
+	if errors.Is(err, errTooLarge) {
+		m.log.Warn("workspace state is too large, saving it without .venv", "err", err)
+		sum, size, err = m.packToFile(ctx, root, spec.Include, append(slices.Clone(spec.Exclude), venvDir), archive)
+	}
+	if err != nil {
+		os.Remove(archive)
+		return "", 0, err
+	}
+	if err := os.WriteFile(m.marker(packedMarker), []byte(fmt.Sprintf("%s %d", sum, size)), 0o644); err != nil {
+		m.log.Warn("could not persist packed archive", "err", err)
+	}
+	return sum, size, nil
+}
+
+func (m *Manager) dropArchive() {
+	for _, name := range []string{outArchive, packedMarker} {
+		if err := os.Remove(m.marker(name)); err != nil && !os.IsNotExist(err) {
+			m.log.Warn("could not remove packed archive", "file", name, "err", err)
 		}
 	}
 }
 
-func (m *Manager) packToFile(ctx context.Context, root string, spec *client.AgentStateSpec, dest string) (string, int64, error) {
+func (m *Manager) packToFile(ctx context.Context, root string, include, exclude []string, dest string) (string, int64, error) {
 	f, err := os.Create(dest)
 	if err != nil {
 		return "", 0, err
 	}
 	h := sha256.New()
 	out := &limitedWriter{ctx: ctx, w: io.MultiWriter(f, h), limit: m.maxUpload}
-	if err := Pack(root, spec.Include, spec.Exclude, out, m.limits); err != nil {
+	if err := Pack(root, include, exclude, out, m.limits); err != nil {
 		f.Close()
 		return "", 0, err
 	}
@@ -471,12 +596,12 @@ func (m *Manager) upload(ctx context.Context, rawURL, file string, size int64) e
 	defer f.Close()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, f)
 	if err != nil {
-		return content.Redact(err)
+		return fetch.Redact(err)
 	}
 	req.ContentLength = size
 	resp, err := m.http.Do(req)
 	if err != nil {
-		return content.Redact(err)
+		return fetch.Redact(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -493,7 +618,7 @@ func errorCode(body []byte) string {
 	if start < 0 || end < start+len("<Code>") {
 		return ""
 	}
-	return " " + content.Clip(s[start+len("<Code>"):end], 64)
+	return " " + fetch.Clip(s[start+len("<Code>"):end], 64)
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -508,8 +633,8 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 func (m *Manager) failed(ctx context.Context, state string, err error) *client.AgentStateObserved {
-	err = content.Redact(err)
-	msg := content.Clip(err.Error(), maxError)
+	err = fetch.Redact(err)
+	msg := fetch.Clip(err.Error(), maxError)
 	m.log.Error("workspace state failed", "state", state, "err", msg)
 	return m.report(ctx, client.AgentStateObserved{ObservedState: state, LastError: &msg})
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/disk"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 )
 
@@ -82,12 +83,67 @@ type fakeDisk struct {
 	rec        *recorder
 	mu         sync.Mutex
 	listCalled bool
+	autoMount  bool
+	mounted    map[string]bool
+	mountErr   error
+	unmountErr error
+	mountIDs   map[string]string
 }
 
-func (f *fakeDisk) Mount(context.Context, client.AgentDiskSpec) error   { return nil }
-func (f *fakeDisk) Unmount(context.Context, string) error               { return nil }
-func (f *fakeDisk) IsActive(context.Context, string) (bool, error)      { return false, nil }
-func (f *fakeDisk) PendingUploads(context.Context, string) (int, error) { return 0, nil }
+func (f *fakeDisk) Mount(_ context.Context, spec client.AgentDiskSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountErr != nil {
+		return f.mountErr
+	}
+	if f.autoMount {
+		f.setLocked(spec.ID, true)
+	}
+	return nil
+}
+
+func (f *fakeDisk) setLocked(id string, mounted bool) {
+	if f.mounted == nil {
+		f.mounted = map[string]bool{}
+	}
+	if mounted {
+		f.mounted[id] = true
+	} else {
+		delete(f.mounted, id)
+	}
+}
+
+func (f *fakeDisk) set(id string, mounted bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setLocked(id, mounted)
+}
+
+func (f *fakeDisk) Unmount(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unmountErr != nil {
+		return f.unmountErr
+	}
+	f.setLocked(id, false)
+	return nil
+}
+
+func (f *fakeDisk) IsActive(_ context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mounted[id], nil
+}
+
+func (f *fakeDisk) Uploads(context.Context, string) (disk.Uploads, error) { return disk.Uploads{}, nil }
+func (f *fakeDisk) EnsureRunning(context.Context, string) error           { return nil }
+
+func (f *fakeDisk) MountID(_ context.Context, id string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mountIDs[id], nil
+}
+
 func (f *fakeDisk) ListUnits() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -95,7 +151,11 @@ func (f *fakeDisk) ListUnits() ([]string, error) {
 		f.rec.add("disk")
 	}
 	f.listCalled = true
-	return nil, nil
+	var ids []string
+	for id := range f.mounted {
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 type fakeContainer struct {
@@ -113,6 +173,10 @@ func (f *fakeContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpe
 	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
 }
 func (f *fakeContainer) SetReporter(func(context.Context, client.AgentContainerObserved)) {}
+func (f *fakeContainer) Restart(context.Context) error {
+	f.rec.add("restart")
+	return nil
+}
 
 type fakeFirewall struct {
 	rec    *recorder
@@ -186,6 +250,7 @@ type fakeLifecycle struct {
 	mu      sync.Mutex
 	current string
 	result  string
+	reason  *string
 	calls   int
 }
 
@@ -199,24 +264,22 @@ func (f *fakeLifecycle) CurrentState() string {
 }
 func (f *fakeLifecycle) SetState(string) error          { return nil }
 func (f *fakeLifecycle) Poweroff(context.Context) error { return nil }
-func (f *fakeLifecycle) HandleTermination(ctx context.Context, _ lifecycle.Disker, hooks lifecycle.Hooks) (string, error) {
+func (f *fakeLifecycle) HandleTermination(ctx context.Context, _ lifecycle.Disker, hooks lifecycle.Hooks) (client.StatusLifecycle, error) {
 	f.mu.Lock()
 	f.calls++
 	result := f.result
+	reason := f.reason
 	f.mu.Unlock()
 	if result == lifecycle.StateSynced && f.CurrentState() == lifecycle.StateSynced {
-		return result, nil
-	}
-	if hooks.BeforeStop != nil {
-		hooks.BeforeStop(ctx)
+		return client.StatusLifecycle{ObservedState: result}, nil
 	}
 	if hooks.AfterStop != nil && !hooks.AfterStop(ctx, nil) {
-		return lifecycle.StateSyncing, nil
+		return client.StatusLifecycle{ObservedState: lifecycle.StateSyncing}, nil
 	}
 	if result == "" {
-		return lifecycle.StateSynced, nil
+		return client.StatusLifecycle{ObservedState: lifecycle.StateSynced}, nil
 	}
-	return result, nil
+	return client.StatusLifecycle{ObservedState: result, LastError: reason}, nil
 }
 
 func (f *fakeLifecycle) terminations() int {
@@ -234,6 +297,7 @@ type fakeState struct {
 	outcome   *client.AgentStateObserved
 	stopErr   error
 	restores  []*client.AgentStateSpec
+	reporter  func(context.Context, client.AgentStateObserved)
 }
 
 func (f *fakeState) Restore(_ context.Context, spec *client.AgentStateSpec, _ *client.AgentContainerSpec) (bool, *client.AgentStateObserved) {
@@ -248,10 +312,6 @@ func (f *fakeState) Restore(_ context.Context, spec *client.AgentStateSpec, _ *c
 		return f.restoreOK, f.obs
 	}
 	return f.restoreOK, &client.AgentStateObserved{ObservedState: client.StateRestoring}
-}
-
-func (f *fakeState) Freeze(_ context.Context, _ *client.AgentStateSpec, name string) {
-	f.rec.add("freeze " + name)
 }
 
 func (f *fakeState) Save(_ context.Context, _ *client.AgentStateSpec, _ *client.AgentContainerSpec, stopErr error) *client.AgentStateObserved {
@@ -271,8 +331,19 @@ func (f *fakeState) Outcome() *client.AgentStateObserved {
 	return f.outcome
 }
 
-func (f *fakeState) SetReporter(func(context.Context, client.AgentStateObserved)) {}
-func (f *fakeState) SetNotify(func())                                             {}
+func (f *fakeState) SetReporter(fn func(context.Context, client.AgentStateObserved)) {
+	f.mu.Lock()
+	f.reporter = fn
+	f.mu.Unlock()
+}
+
+func (f *fakeState) fire(obs client.AgentStateObserved) {
+	f.mu.Lock()
+	report := f.reporter
+	f.mu.Unlock()
+	report(context.Background(), obs)
+}
+func (f *fakeState) SetNotify(func()) {}
 
 func (f *fakeState) restoreSpecs() []*client.AgentStateSpec {
 	f.mu.Lock()
@@ -469,6 +540,10 @@ func (g *gatedContainer) Reconcile(ctx context.Context, _ *client.AgentContainer
 	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
 }
 func (g *gatedContainer) SetReporter(func(context.Context, client.AgentContainerObserved)) {}
+func (g *gatedContainer) Restart(context.Context) error {
+	g.rec.add("restart")
+	return nil
+}
 
 func contentAgent(rec *recorder, content *fakeContent, cont ContainerReconciler) (*Agent, *fakeClient) {
 	cl := &fakeClient{}
@@ -655,7 +730,7 @@ func TestSpecWithoutStateSkipsRestore(t *testing.T) {
 	}
 }
 
-func TestTerminationFreezesThenSavesState(t *testing.T) {
+func TestTerminationSavesState(t *testing.T) {
 	rec := &recorder{}
 	a, cl := stateAgent(rec, &fakeState{rec: rec})
 	spec := deletion(specWithWork())
@@ -666,9 +741,8 @@ func TestTerminationFreezesThenSavesState(t *testing.T) {
 		t.Fatalf("handleSpec: %v", err)
 	}
 
-	freeze, save := rec.index("freeze app_container"), rec.index("save")
-	if freeze < 0 || save < 0 || freeze > save {
-		t.Fatalf("want freeze then save, got %v", rec.list())
+	if rec.index("save") < 0 {
+		t.Fatalf("want save, got %v", rec.list())
 	}
 	last := cl.last()
 	if last.State == nil || last.State.ObservedState != client.StateSaved {
@@ -858,37 +932,6 @@ func TestLatestSpecWinsAfterLongPass(t *testing.T) {
 	}
 }
 
-func TestRestoreStartsWhileModelsStillDownload(t *testing.T) {
-	rec := &recorder{}
-	h := startRun(t, rec, &gatedContainer{rec: rec})
-
-	spec := specWithModel()
-	spec.State = &client.AgentStateSpec{Pending: true}
-	h.send(spec)
-	eventually(t, "waiting status", func() bool {
-		return h.client.find(func(s *client.AgentStatus) bool {
-			return s.State != nil && s.State.ObservedState == client.StateWaiting
-		}) != nil
-	})
-
-	next := specWithModel()
-	next.Generation = 2
-	next.State = &client.AgentStateSpec{Restore: &client.StateRestore{URL: "http://b2/get", SHA256: "abc", SizeBytes: 1}}
-	h.send(next)
-
-	eventually(t, "restore of the saved state", func() bool {
-		for _, s := range h.state.restoreSpecs() {
-			if !s.Pending {
-				return true
-			}
-		}
-		return false
-	})
-	if _, settled := h.content.Observe(); settled {
-		t.Fatal("models were meant to be still downloading")
-	}
-}
-
 func TestSettledContentWakesTheAgent(t *testing.T) {
 	rec := &recorder{}
 	h := startRun(t, rec, &gatedContainer{rec: rec})
@@ -899,4 +942,270 @@ func TestSettledContentWakesTheAgent(t *testing.T) {
 	h.content.settle(client.AgentContentObserved{ObservedState: client.ContentReady})
 
 	eventually(t, "container start after content settled", func() bool { return rec.index("run") >= 0 })
+}
+
+func diskSpec(id string) client.AgentDiskSpec {
+	return client.AgentDiskSpec{ID: id, DesiredState: client.DesiredMounted, Bucket: "b", S3Path: "u/" + id + "/", MountPath: "/root/workspace/storage/comfyui-online"}
+}
+
+func TestContainerWaitsForDisks(t *testing.T) {
+	rec := &recorder{}
+	a, cl, dk, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	a.cfg.Container = &gatedContainer{rec: rec}
+	spec := specWithWork()
+	spec.Disks = []client.AgentDiskSpec{diskSpec("d1")}
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.index("gate-closed") < 0 || rec.index("run") >= 0 {
+		t.Fatalf("container must not start before its disk is mounted: %v", rec.list())
+	}
+	last := cl.last()
+	if last.Container == nil || last.Container.ObservedState != client.ContainerStarting || last.Container.Detail == nil || *last.Container.Detail != "ждём диск comfyui-online" {
+		t.Fatalf("waiting container must be starting with the disk in detail, got %+v", last.Container)
+	}
+	if len(last.Disks) != 1 || last.Disks[0].ObservedState != client.ObservedUnmounted {
+		t.Fatalf("disks = %+v", last.Disks)
+	}
+
+	dk.set("d1", true)
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.index("run") < 0 {
+		t.Fatalf("container must start once the disk is mounted: %v", rec.list())
+	}
+}
+
+func TestMountFailureIsReportedOnTheDisk(t *testing.T) {
+	rec := &recorder{}
+	a, cl, dk, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	a.cfg.Container = &gatedContainer{rec: rec}
+	dk.mountErr = errors.New("unit storage-mount-d1.service did not become active")
+	spec := specWithWork()
+	spec.Disks = []client.AgentDiskSpec{diskSpec("d1")}
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	last := cl.last()
+	if len(last.Disks) != 1 || last.Disks[0].ObservedState != client.ObservedError || last.Disks[0].LastError == nil {
+		t.Fatalf("failed mount must be an error on the disk, got %+v", last.Disks)
+	}
+	if rec.index("run") >= 0 {
+		t.Fatal("container started without its disk")
+	}
+}
+
+func TestRemountRestartsRunningContainer(t *testing.T) {
+	rec := &recorder{}
+	a, _, dk, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	dk.set("d1", true)
+	dk.mountIDs = map[string]string{"d1": "inv-1"}
+	spec := specWithWork()
+	spec.Disks = []client.AgentDiskSpec{diskSpec("d1")}
+	a.lastSpec.Store(spec)
+
+	for range 2 {
+		if err := a.handleSpec(context.Background(), spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rec.index("restart") >= 0 {
+		t.Fatalf("container restarted without a remount: %v", rec.list())
+	}
+
+	dk.mu.Lock()
+	dk.mountIDs["d1"] = "inv-2"
+	dk.mu.Unlock()
+	for range 2 {
+		if err := a.handleSpec(context.Background(), spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restarts := 0
+	for _, e := range rec.list() {
+		if e == "restart" {
+			restarts++
+		}
+	}
+	if restarts != 1 {
+		t.Fatalf("remount under a running container must restart it once, got %d: %v", restarts, rec.list())
+	}
+}
+
+func TestFlushingDiskStaysMounted(t *testing.T) {
+	rec := &recorder{}
+	a, cl, dk, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	dk.set("d1", true)
+	dk.unmountErr = disk.ErrFlushing
+	spec := specWithWork()
+	d := diskSpec("d1")
+	d.DesiredState = client.DesiredUnmounted
+	spec.Disks = []client.AgentDiskSpec{d}
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	last := cl.last()
+	if len(last.Disks) != 1 || last.Disks[0].ObservedState != client.ObservedMounted || last.Disks[0].LastError != nil {
+		t.Fatalf("disk that still uploads must stay mounted without an error, got %+v", last.Disks)
+	}
+}
+
+type fakeTunnel struct {
+	ok     bool
+	reason string
+}
+
+func (f *fakeTunnel) Reconcile(context.Context, *client.AgentTunnelSpec) {}
+func (f *fakeTunnel) Status([]string) (bool, string)                     { return f.ok, f.reason }
+
+func TestTunnelStateIsReported(t *testing.T) {
+	rec := &recorder{}
+	a, cl, _, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	a.cfg.Container = nil
+	tunnel := &fakeTunnel{reason: "нет связи со шлюзом"}
+	a.cfg.Tunnel = tunnel
+	spec := specWithWork()
+	spec.Tunnel = &client.AgentTunnelSpec{Slug: "s", FrpsAddr: "gw:7000", Proxies: []client.TunnelProxy{{Subdomain: "s-comfyui", LocalPort: 8188}}}
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.last().Tunnel; got == nil || got.ObservedState != client.TunnelDisconnected || got.LastError == nil || *got.LastError != "нет связи со шлюзом" {
+		t.Fatalf("broken tunnel must be reported, got %+v", got)
+	}
+
+	tunnel.ok = true
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.last().Tunnel; got == nil || got.ObservedState != client.TunnelConnected || got.LastError != nil {
+		t.Fatalf("working tunnel must be reported connected, got %+v", got)
+	}
+
+	spec.Tunnel = nil
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.last().Tunnel; got != nil {
+		t.Fatalf("no tunnel in the spec, nothing to report, got %+v", got)
+	}
+}
+
+func TestObservedGenerationOnlyAfterFullPass(t *testing.T) {
+	rec := &recorder{}
+	a, cl, _, _, _, hs := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupInstallingDocker})
+	spec := specWithWork()
+	spec.Generation = 5
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	a.reportContainerPhase(context.Background(), client.AgentContainerObserved{ObservedState: client.ContainerPulling})
+	for _, s := range cl.posted() {
+		if s.ObservedGeneration != 0 {
+			t.Fatalf("generation confirmed before the pass finished: %+v", s)
+		}
+	}
+
+	hs.obs = client.AgentSetupObserved{ObservedState: client.SetupReady}
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.last().ObservedGeneration; got != 5 {
+		t.Fatalf("full pass must confirm generation 5, got %d", got)
+	}
+
+	next := specWithWork()
+	next.Generation = 6
+	a.lastSpec.Store(next)
+	a.reportContainerPhase(context.Background(), client.AgentContainerObserved{ObservedState: client.ContainerPulling})
+	if got := cl.last().ObservedGeneration; got != 5 {
+		t.Fatalf("phase report during pass 6 must carry the last applied generation, got %d", got)
+	}
+}
+
+type failingSSH struct{}
+
+func (failingSSH) Reconcile(*client.AgentSSHSpec) error {
+	return errors.New("authorized_keys: read-only file system")
+}
+
+func TestFailedSSHKeysDoNotConfirmGeneration(t *testing.T) {
+	rec := &recorder{}
+	a, cl, _, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	a.cfg.SSHKeys = failingSSH{}
+	spec := specWithWork()
+	spec.Generation = 3
+	spec.SSH = &client.AgentSSHSpec{User: "root", AuthorizedKeys: []string{"ssh-ed25519 AAAA"}}
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.last().ObservedGeneration; got != 0 {
+		t.Fatalf("key that was not written must not be confirmed, got generation %d", got)
+	}
+}
+
+type failingRestoreContainer struct {
+	st  *fakeState
+	rec *recorder
+}
+
+func (f *failingRestoreContainer) Reconcile(_ context.Context, _ *client.AgentContainerSpec, beforeStart func() bool) client.AgentContainerObserved {
+	msg := "state download: http 404"
+	f.st.fire(client.AgentStateObserved{ObservedState: client.StateRestoreFailed, LastError: &msg})
+	if beforeStart != nil && !beforeStart() {
+		return client.AgentContainerObserved{ObservedState: client.ContainerPulling}
+	}
+	return client.AgentContainerObserved{ObservedState: client.ContainerRunning}
+}
+func (f *failingRestoreContainer) SetReporter(func(context.Context, client.AgentContainerObserved)) {}
+func (f *failingRestoreContainer) Restart(context.Context) error                                    { return nil }
+
+func TestRestoringIsNotSentAfterRestoreFailed(t *testing.T) {
+	rec := &recorder{}
+	st := &fakeState{rec: rec}
+	a, cl := stateAgent(rec, st)
+	a.cfg.Container = &failingRestoreContainer{st: st, rec: rec}
+	spec := specWithWork()
+	spec.State = &client.AgentStateSpec{Restore: &client.StateRestore{URL: "http://b2/get", SHA256: "abc", SizeBytes: 1}}
+	a.lastSpec.Store(spec)
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	last := cl.last()
+	if last.State == nil || last.State.ObservedState != client.StateRestoreFailed {
+		t.Fatalf("status after restore_failed must not go back to restoring, got %+v", last.State)
+	}
+}
+
+func TestLifecycleErrorReasonIsReported(t *testing.T) {
+	rec := &recorder{}
+	a, cl := stateAgent(rec, &fakeState{rec: rec})
+	reason := "выгрузка кэша дисков не движется 15m0s"
+	a.cfg.Lifecycle = &fakeLifecycle{result: lifecycle.StateError, reason: &reason}
+	spec := deletion(specWithWork())
+
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	last := cl.last()
+	if last.Lifecycle.ObservedState != lifecycle.StateError || last.Lifecycle.LastError == nil || *last.Lifecycle.LastError != reason {
+		t.Fatalf("lifecycle error must carry its reason, got %+v", last.Lifecycle)
+	}
 }

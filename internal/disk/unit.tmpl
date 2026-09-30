@@ -2,28 +2,17 @@
 Description=S3 Storage Mount ({{.DriveID}})
 After=network-online.target
 Wants=network-online.target
+Before=docker.service
 
 [Service]
 Type=notify
 TimeoutStopSec=1800
-ExecStart=/usr/bin/rclone mount {{.Remote}}:{{.Bucket}}/{{.S3Path}} {{.MountPath}} \
-  --config /root/.config/rclone/rclone.conf \
-  --vfs-cache-mode full \
-  --vfs-cache-max-size {{.QuotaGB}}G \
-  --vfs-cache-max-age 24h \
-  --dir-cache-time 1m \
-  --vfs-read-chunk-size 4M \
-  --vfs-read-chunk-streams 32 \
-  --s3-upload-concurrency 16 \
-  --s3-chunk-size 64M \
-  --allow-other \
-  --daemon-timeout=10m \
-  --rc \
-  --rc-addr 127.0.0.1:{{.RcPort}} \
-  --rc-no-auth
+EnvironmentFile={{.EnvFile}}
+ExecStart={{.Command}}
 ExecStop=/bin/fusermount -uz {{.MountPath}}
 Restart=on-failure
 RestartSec=10
+OOMScoreAdjust=-900
 User=root
 
 [Install]

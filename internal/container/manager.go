@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 	"github.com/bogdanaks/yougpu-agent/internal/system"
 )
 
@@ -26,7 +27,9 @@ const (
 	dockerTimeout    = 5 * time.Second
 	pullTimeout      = 10 * time.Minute
 	runTimeout       = 2 * time.Minute
+	restartTimeout   = 2 * time.Minute
 	reportThrottle   = 5 * time.Second
+	maxError         = 1024
 	inspectNoExit    = "no such object"
 	inspectNotFound  = "No such object"
 )
@@ -164,7 +167,7 @@ func (m *Manager) report(hasSpec bool, desiredHash string, obs Observed, applyEr
 }
 
 func (m *Manager) errorReport(hash string, err error) client.AgentContainerObserved {
-	msg := truncate(err.Error(), 1024)
+	msg := fetch.Clip(err.Error(), maxError)
 	return client.AgentContainerObserved{ObservedState: client.ContainerError, SpecHash: hash, LastError: &msg}
 }
 
@@ -260,6 +263,7 @@ func (m *Manager) runArgs(spec *client.AgentContainerSpec, hash string) []string
 	args := []string{
 		"run", "-d",
 		"--name", m.name,
+		"--init",
 		"--restart", "unless-stopped",
 		"--network", "host",
 		"--label", labelManaged + "=true",
@@ -277,7 +281,7 @@ func (m *Manager) runArgs(spec *client.AgentContainerSpec, hash string) []string
 		if v.Host == "" || v.Container == "" {
 			continue
 		}
-		args = append(args, "-v", v.Host+":"+v.Container+":rw")
+		args = append(args, "-v", v.Host+":"+v.Container+":rw,rslave")
 	}
 	for _, k := range sortedKeys(spec.Env) {
 		args = append(args, "-e", k+"="+spec.Env[k])
@@ -306,9 +310,7 @@ func isNotFound(err error) bool {
 	return strings.Contains(s, inspectNoExit) || strings.Contains(s, inspectNotFound)
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+func (m *Manager) Restart(ctx context.Context) error {
+	_, err := m.exec.Run(ctx, restartTimeout, "docker", "restart", "-t", "30", m.name)
+	return err
 }

@@ -145,13 +145,6 @@ func (c *Client) GetStorageCredentials(ctx context.Context) (*StorageCredentials
 	return &resp, nil
 }
 
-func (c *Client) ReportProvisioningStatus(ctx context.Context, req *ProvisioningStatusRequest) error {
-	if err := c.do(ctx, http.MethodPost, "/provisioning-status", req, nil); err != nil {
-		return fmt.Errorf("report provisioning status: %w", err)
-	}
-	return nil
-}
-
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
 	var buf []byte
 	if body != nil {

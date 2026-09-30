@@ -8,13 +8,15 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
-	"github.com/bogdanaks/yougpu-agent/internal/container"
+	"github.com/bogdanaks/yougpu-agent/internal/disk"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/reconcile"
 )
@@ -25,6 +27,8 @@ const (
 	endpointDialTimeout         = 2 * time.Second
 	poweroffDelay               = 5 * time.Second
 	phaseReportTimeout          = 5 * time.Second
+	maxError                    = 1024
+	maxContainerDetail          = 64
 )
 
 type AgentClient interface {
@@ -38,12 +42,15 @@ type DiskManager interface {
 	Unmount(ctx context.Context, id string) error
 	ListUnits() ([]string, error)
 	IsActive(ctx context.Context, id string) (bool, error)
-	PendingUploads(ctx context.Context, id string) (int, error)
+	MountID(ctx context.Context, id string) (string, error)
+	Uploads(ctx context.Context, id string) (disk.Uploads, error)
+	EnsureRunning(ctx context.Context, id string) error
 }
 
 type ContainerReconciler interface {
 	Reconcile(ctx context.Context, spec *client.AgentContainerSpec, beforeStart func() bool) client.AgentContainerObserved
 	SetReporter(func(context.Context, client.AgentContainerObserved))
+	Restart(ctx context.Context) error
 }
 
 type FirewallReconciler interface {
@@ -56,7 +63,7 @@ type SSHKeysReconciler interface {
 
 type TunnelReconciler interface {
 	Reconcile(ctx context.Context, spec *client.AgentTunnelSpec)
-	Ready(subdomains []string) bool
+	Status(subdomains []string) (bool, string)
 }
 
 type HostSetup interface {
@@ -75,13 +82,12 @@ type ContentReconciler interface {
 type LifecycleManager interface {
 	CurrentState() string
 	SetState(state string) error
-	HandleTermination(ctx context.Context, disker lifecycle.Disker, hooks lifecycle.Hooks) (string, error)
+	HandleTermination(ctx context.Context, disker lifecycle.Disker, hooks lifecycle.Hooks) (client.StatusLifecycle, error)
 	Poweroff(ctx context.Context) error
 }
 
 type StateManager interface {
 	Restore(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec) (bool, *client.AgentStateObserved)
-	Freeze(ctx context.Context, spec *client.AgentStateSpec, containerName string)
 	Save(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec, stopErr error) *client.AgentStateObserved
 	Outcome() *client.AgentStateObserved
 	SetReporter(func(context.Context, client.AgentStateObserved))
@@ -121,6 +127,13 @@ type Agent struct {
 	containerReadyHash string
 	inbox              inbox
 	wake               chan struct{}
+	applied            atomic.Int64
+	mountIDs           map[string]string
+	containerAlive     bool
+
+	postMu       sync.Mutex
+	stateReports int
+	lastState    *client.AgentStateObserved
 
 	aliveMu     sync.Mutex
 	aliveCtx    context.Context
@@ -220,7 +233,7 @@ func (a *Agent) reportPhase(ctx context.Context, kind, state string, fill func(*
 		return
 	}
 	status := &client.AgentStatus{
-		ObservedGeneration: spec.Generation,
+		ObservedGeneration: a.applied.Load(),
 		Lifecycle:          client.StatusLifecycle{ObservedState: a.cfg.Lifecycle.CurrentState()},
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
@@ -228,7 +241,7 @@ func (a *Agent) reportPhase(ctx context.Context, kind, state string, fill func(*
 	fill(status)
 	reportCtx, cancel := context.WithTimeout(ctx, phaseReportTimeout)
 	defer cancel()
-	if err := a.cfg.Client.PostStatus(reportCtx, status); err != nil {
+	if err := a.postStatus(reportCtx, status, -1); err != nil {
 		a.cfg.Logger.Warn(kind+" phase report failed", "state", state, "err", err)
 	}
 }
@@ -254,9 +267,6 @@ func (a *Agent) terminationHooks(spec *client.AgentSpec, saved **client.AgentSta
 		return lifecycle.Hooks{}
 	}
 	return lifecycle.Hooks{
-		BeforeStop: func(ctx context.Context) {
-			a.cfg.State.Freeze(ctx, spec.State, container.AppContainerName)
-		},
 		AfterStop: func(ctx context.Context, stopErr error) bool {
 			obs := a.cfg.State.Save(ctx, spec.State, spec.Container, stopErr)
 			*saved = obs
@@ -417,8 +427,10 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	work := a.aliveContext(ctx)
 	_ = a.cfg.Lifecycle.SetState(lifecycle.StateAlive)
 
+	complete := true
 	if a.cfg.SSHKeys != nil && spec.SSH != nil {
 		if err := a.cfg.SSHKeys.Reconcile(spec.SSH); err != nil {
+			complete = false
 			a.cfg.Logger.Error("ssh keys reconcile failed", "err", err)
 		}
 	}
@@ -432,12 +444,12 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 				return nil
 			}
 			return a.postStatus(ctx, &client.AgentStatus{
-				ObservedGeneration: spec.Generation,
+				ObservedGeneration: a.applied.Load(),
 				Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
 				Setup:              setupObserved,
 				AgentVersion:       a.cfg.Version,
 				UptimeSec:          int64(time.Since(a.started).Seconds()),
-			})
+			}, -1)
 		}
 	}
 
@@ -451,6 +463,7 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		a.cfg.Content.Stop()
 	}
 
+	stateSeen := a.stateSeq()
 	stateReady := true
 	var stateObserved *client.AgentStateObserved
 	restore := func() {
@@ -462,6 +475,7 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 
 	var containerObserved *client.AgentContainerObserved
 	if a.cfg.Container != nil {
+		hold := ""
 		obs := a.cfg.Container.Reconcile(work, spec.Container, func() bool {
 			restore()
 			if hasContent {
@@ -469,9 +483,18 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 					return false
 				}
 			}
-			return stateReady
+			if !stateReady {
+				return false
+			}
+			hold = a.diskHold(work, spec)
+			return hold == ""
 		})
+		if hold != "" && obs.ObservedState == client.ContainerPulling {
+			obs.ObservedState = client.ContainerStarting
+			obs.Detail = &hold
+		}
 		containerObserved = &obs
+		a.followRemounts(work, spec, obs.ObservedState)
 	}
 	var firewallObserved *client.AgentFirewallObserved
 	if a.cfg.Firewall != nil && spec.Firewall != nil {
@@ -499,8 +522,12 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		}
 	}
 
-	return a.postStatus(ctx, &client.AgentStatus{
-		ObservedGeneration: spec.Generation,
+	generation := a.applied.Load()
+	if complete {
+		generation = spec.Generation
+	}
+	err := a.postStatus(ctx, &client.AgentStatus{
+		ObservedGeneration: generation,
 		Lifecycle:          client.StatusLifecycle{ObservedState: lifecycle.StateAlive},
 		Disks:              disksObserved,
 		Container:          containerObserved,
@@ -508,9 +535,74 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		Setup:              setupObserved,
 		Content:            contentObserved,
 		State:              stateObserved,
+		Tunnel:             a.tunnelObserved(spec),
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
-	})
+	}, stateSeen)
+	if err == nil && complete {
+		a.applied.Store(spec.Generation)
+	}
+	return err
+}
+
+func (a *Agent) diskHold(ctx context.Context, spec *client.AgentSpec) string {
+	mounted := a.observeDisks(ctx).MountedDiskIDs
+	for _, d := range spec.Disks {
+		if d.DesiredState != client.DesiredMounted || mounted[d.ID] {
+			continue
+		}
+		name := filepath.Base(d.MountPath)
+		if d.MountPath == "" || name == "/" || name == "." {
+			name = d.ID
+		}
+		return fetch.Clip("ждём диск "+name, maxContainerDetail)
+	}
+	return ""
+}
+
+func (a *Agent) followRemounts(ctx context.Context, spec *client.AgentSpec, containerState string) {
+	current := map[string]string{}
+	for _, d := range spec.Disks {
+		if d.DesiredState != client.DesiredMounted {
+			continue
+		}
+		id, err := a.cfg.Disk.MountID(ctx, d.ID)
+		switch {
+		case err == nil && id != "":
+			current[d.ID] = id
+		case a.mountIDs[d.ID] != "":
+			current[d.ID] = a.mountIDs[d.ID]
+		}
+	}
+	alive := containerState == client.ContainerRunning || containerState == client.ContainerReady
+	if alive && a.containerAlive {
+		for id, now := range current {
+			if before, ok := a.mountIDs[id]; ok && before != now {
+				a.cfg.Logger.Info("disk remounted under a running container, restarting the container", "id", id)
+				if err := a.cfg.Container.Restart(ctx); err != nil {
+					a.cfg.Logger.Error("container restart after remount failed", "err", err)
+				}
+				break
+			}
+		}
+	}
+	a.containerAlive = alive
+	a.mountIDs = current
+}
+
+func (a *Agent) tunnelObserved(spec *client.AgentSpec) *client.AgentTunnelObserved {
+	if a.cfg.Tunnel == nil || spec.Tunnel == nil || len(spec.Tunnel.Proxies) == 0 {
+		return nil
+	}
+	subdomains := make([]string, 0, len(spec.Tunnel.Proxies))
+	for _, p := range spec.Tunnel.Proxies {
+		subdomains = append(subdomains, p.Subdomain)
+	}
+	if ok, reason := a.cfg.Tunnel.Status(subdomains); !ok {
+		msg := fetch.Clip(reason, maxError)
+		return &client.AgentTunnelObserved{ObservedState: client.TunnelDisconnected, LastError: &msg}
+	}
+	return &client.AgentTunnelObserved{ObservedState: client.TunnelConnected}
 }
 
 func (a *Agent) terminate(ctx context.Context, spec *client.AgentSpec) error {
@@ -528,11 +620,11 @@ func (a *Agent) terminate(ctx context.Context, spec *client.AgentSpec) error {
 	}
 	return a.postStatus(ctx, &client.AgentStatus{
 		ObservedGeneration: spec.Generation,
-		Lifecycle:          client.StatusLifecycle{ObservedState: observed},
+		Lifecycle:          observed,
 		State:              stateObserved,
 		AgentVersion:       a.cfg.Version,
 		UptimeSec:          int64(time.Since(a.started).Seconds()),
-	})
+	}, -1)
 }
 
 func deref(s *string) string {
@@ -583,7 +675,11 @@ func (a *Agent) readinessTargets(spec *client.AgentSpec) ([]int, func() bool) {
 			subdomains = append(subdomains, p.Subdomain)
 		}
 		return ports, func() bool {
-			return a.cfg.Tunnel != nil && a.cfg.Tunnel.Ready(subdomains)
+			if a.cfg.Tunnel == nil {
+				return false
+			}
+			ok, _ := a.cfg.Tunnel.Status(subdomains)
+			return ok
 		}
 	}
 	return nil, func() bool { return true }
@@ -600,9 +696,24 @@ func (a *Agent) portsListening(ports []int) bool {
 	return true
 }
 
-func (a *Agent) postStatus(ctx context.Context, status *client.AgentStatus) error {
+func (a *Agent) stateSeq() int {
+	a.postMu.Lock()
+	defer a.postMu.Unlock()
+	return a.stateReports
+}
+
+func (a *Agent) postStatus(ctx context.Context, status *client.AgentStatus, stateSeen int) error {
+	a.postMu.Lock()
+	defer a.postMu.Unlock()
+	if stateSeen >= 0 && status.State != nil && a.stateReports != stateSeen && a.lastState != nil {
+		status.State = a.lastState
+	}
 	if err := a.cfg.Client.PostStatus(ctx, status); err != nil {
 		return fmt.Errorf("post status: %w", err)
+	}
+	if status.State != nil {
+		a.stateReports++
+		a.lastState = status.State
 	}
 	return nil
 }
@@ -646,18 +757,22 @@ func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []cl
 			a.cfg.Logger.Info("mounting disk", "id", v.Spec.ID, "path", v.Spec.MountPath)
 			if err := a.cfg.Disk.Mount(ctx, v.Spec); err != nil {
 				a.cfg.Logger.Error("mount failed", "id", v.Spec.ID, "err", err)
-				errs[v.Spec.ID] = truncate(err.Error(), 1024)
+				errs[v.Spec.ID] = fetch.Clip(err.Error(), maxError)
 				mountErrored = true
 			}
 		case reconcile.UnmountDisk:
 			a.cfg.Logger.Info("unmounting disk", "id", v.ID)
-			if err := a.cfg.Disk.Unmount(ctx, v.ID); err != nil {
+			if err := a.cfg.Disk.Unmount(ctx, v.ID); errors.Is(err, disk.ErrFlushing) {
+				a.cfg.Logger.Info("disk keeps uploading its cache, unmount postponed", "id", v.ID)
+			} else if err != nil {
 				a.cfg.Logger.Error("unmount failed", "id", v.ID, "err", err)
-				errs[v.ID] = truncate(err.Error(), 1024)
+				errs[v.ID] = fetch.Clip(err.Error(), maxError)
 			}
 		case reconcile.UnmountOrphan:
 			a.cfg.Logger.Info("unmounting orphan unit", "id", v.ID)
-			if err := a.cfg.Disk.Unmount(ctx, v.ID); err != nil {
+			if err := a.cfg.Disk.Unmount(ctx, v.ID); errors.Is(err, disk.ErrFlushing) {
+				a.cfg.Logger.Info("orphan disk keeps uploading its cache, unmount postponed", "id", v.ID)
+			} else if err != nil {
 				a.cfg.Logger.Error("orphan unmount failed", "id", v.ID, "err", err)
 			}
 		}
@@ -674,7 +789,7 @@ func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []cl
 					a.cfg.Logger.Info("retrying mount after creds refresh", "id", v.Spec.ID)
 					if err := a.cfg.Disk.Mount(ctx, v.Spec); err != nil {
 						a.cfg.Logger.Error("retry mount failed", "id", v.Spec.ID, "err", err)
-						errs[v.Spec.ID] = truncate(err.Error(), 1024)
+						errs[v.Spec.ID] = fetch.Clip(err.Error(), maxError)
 					} else {
 						delete(errs, v.Spec.ID)
 					}
@@ -739,16 +854,9 @@ func (a *Agent) waitForDestroy(ctx context.Context) error {
 			if a.cfg.State != nil {
 				status.State = a.cfg.State.Outcome()
 			}
-			if err := a.cfg.Client.PostStatus(ctx, status); err != nil {
+			if err := a.postStatus(ctx, status, -1); err != nil {
 				a.cfg.Logger.Warn("post-synced status failed", "err", err)
 			}
 		}
 	}
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }

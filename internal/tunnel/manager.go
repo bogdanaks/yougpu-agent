@@ -19,10 +19,11 @@ import (
 type Manager struct {
 	log *slog.Logger
 
-	mu     sync.Mutex
-	hash   string
-	cancel context.CancelFunc
-	svc    *frpclient.Service
+	mu       sync.Mutex
+	hash     string
+	cancel   context.CancelFunc
+	svc      *frpclient.Service
+	startErr string
 }
 
 func NewManager(log *slog.Logger) *Manager {
@@ -34,6 +35,7 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentTunnelSpec) {
 	defer m.mu.Unlock()
 
 	if spec == nil || len(spec.Proxies) == 0 {
+		m.startErr = ""
 		if m.cancel != nil {
 			m.log.Info("tunnel stopping", "reason", "no spec")
 			m.stopLocked()
@@ -49,7 +51,9 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentTunnelSpec) {
 		m.log.Info("tunnel restarting", "reason", "spec changed")
 		m.stopLocked()
 	}
+	m.startErr = ""
 	if err := m.startLocked(ctx, spec, desired); err != nil {
+		m.startErr = err.Error()
 		m.log.Error("tunnel start failed", "err", err)
 	}
 }
@@ -62,20 +66,34 @@ func (m *Manager) stopLocked() {
 }
 
 func (m *Manager) Ready(subdomains []string) bool {
+	ok, _ := m.Status(subdomains)
+	return ok
+}
+
+func (m *Manager) Status(subdomains []string) (bool, string) {
 	m.mu.Lock()
-	svc := m.svc
+	svc, startErr := m.svc, m.startErr
 	m.mu.Unlock()
 	if svc == nil {
-		return false
+		if startErr != "" {
+			return false, startErr
+		}
+		return false, "туннель не запущен"
 	}
 	exporter := svc.StatusExporter()
 	for _, name := range subdomains {
 		ws, ok := exporter.GetProxyStatus(name)
-		if !ok || ws.Phase != "running" {
-			return false
+		if !ok {
+			return false, "нет связи со шлюзом"
+		}
+		if ws.Phase != "running" {
+			if ws.Err != "" {
+				return false, name + ": " + ws.Err
+			}
+			return false, name + ": " + ws.Phase
 		}
 	}
-	return true
+	return true, ""
 }
 
 func (m *Manager) startLocked(ctx context.Context, spec *client.AgentTunnelSpec, hash string) error {

@@ -292,3 +292,19 @@ func randomBytes(n int) []byte {
 	}
 	return b
 }
+
+func TestPackKeepsSubsecondMtime(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, src, "user/default/workflows/w.json", "{}", 0o644)
+	stamp := time.Date(2026, 9, 1, 12, 0, 0, 123456789, time.UTC)
+	if err := os.Chtimes(filepath.Join(src, "user/default/workflows/w.json"), stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := roundTrip(t, src)
+
+	info, err := os.Stat(filepath.Join(dst, "user/default/workflows/w.json"))
+	if err != nil || !info.ModTime().Equal(stamp) {
+		t.Fatalf("mtime %v, want %v (%v)", info.ModTime(), stamp, err)
+	}
+}

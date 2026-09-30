@@ -20,6 +20,7 @@ type Systemd interface {
 	Stop(ctx context.Context, unit string) error
 	Restart(ctx context.Context, unit string) error
 	IsActive(ctx context.Context, unit string) (bool, error)
+	InvocationID(ctx context.Context, unit string) (string, error)
 	Poweroff(ctx context.Context) error
 }
 
@@ -72,6 +73,11 @@ func (s *Systemctl) IsActive(ctx context.Context, unit string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+func (s *Systemctl) InvocationID(ctx context.Context, unit string) (string, error) {
+	out, err := s.exec.Run(ctx, defaultSystemctlTimeout, "systemctl", "show", "-p", "InvocationID", "--value", unit)
+	return strings.TrimSpace(out), err
 }
 
 func (s *Systemctl) Poweroff(ctx context.Context) error {

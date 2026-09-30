@@ -1,6 +1,10 @@
 package tunnel
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
@@ -64,5 +68,23 @@ func TestSpecHash(t *testing.T) {
 	}
 	if specHash(a) == specHash(b) {
 		t.Fatal("hash must differ when a proxy port differs")
+	}
+}
+
+func TestStatusWithoutRunningTunnelIsDisconnected(t *testing.T) {
+	m := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	ok, reason := m.Status([]string{"k7m2p9qx-comfyui"})
+	if ok || reason == "" {
+		t.Fatalf("tunnel that never started must be disconnected with a reason, got %v %q", ok, reason)
+	}
+
+	m.Reconcile(context.Background(), &client.AgentTunnelSpec{FrpsAddr: "no-port", Proxies: []client.TunnelProxy{{Subdomain: "k7m2p9qx-comfyui", LocalPort: 8188}}})
+	ok, reason = m.Status([]string{"k7m2p9qx-comfyui"})
+	if ok || !strings.Contains(reason, "no-port") {
+		t.Fatalf("start failure must be the reason, got %v %q", ok, reason)
+	}
+	if m.Ready([]string{"k7m2p9qx-comfyui"}) {
+		t.Fatal("disconnected tunnel reported ready")
 	}
 }

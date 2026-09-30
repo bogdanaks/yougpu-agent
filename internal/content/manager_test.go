@@ -21,6 +21,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 )
 
 func newTestManager() *Manager { return New(slog.New(slog.NewTextHandler(io.Discard, nil))) }
@@ -63,20 +64,7 @@ func settle(t *testing.T, mgr *Manager, spec *client.AgentContentSpec, container
 
 func containerWith(root string) *client.AgentContainerSpec {
 	return &client.AgentContainerSpec{
-		Volumes: []client.ContainerVolume{{Host: root, Container: WorkspaceContainerPath}},
-	}
-}
-
-func TestWorkspaceRoot(t *testing.T) {
-	if got := WorkspaceRoot(containerWith("/root/workspace")); got != "/root/workspace" {
-		t.Fatalf("want /root/workspace, got %q", got)
-	}
-	if got := WorkspaceRoot(nil); got != "" {
-		t.Fatalf("want empty for nil container, got %q", got)
-	}
-	noWs := &client.AgentContainerSpec{Volumes: []client.ContainerVolume{{Host: "/x", Container: "/data"}}}
-	if got := WorkspaceRoot(noWs); got != "" {
-		t.Fatalf("want empty when no /workspace volume, got %q", got)
+		Volumes: []client.ContainerVolume{{Host: root, Container: fetch.WorkspaceContainerPath}},
 	}
 }
 
@@ -134,38 +122,6 @@ func TestReconcileDedupSkipsPresent(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Fatalf("expected 1 download (dedup), got %d", hits)
-	}
-}
-
-func TestReconcileReplacesZeroSizePlaceholder(t *testing.T) {
-	root := t.TempDir()
-	placeholder := filepath.Join(root, "models", "vae", "m.bin")
-	if err := os.MkdirAll(filepath.Dir(placeholder), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(placeholder, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	body := []byte("weights")
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(body)
-	}))
-	defer srv.Close()
-
-	spec := &client.AgentContentSpec{
-		Models: []client.ContentModel{{URL: srv.URL + "/m", Type: "vae", Name: "m.bin"}},
-	}
-	if obs := settle(t, newTestManager(), spec, containerWith(root)); obs.ObservedState != client.ContentReady {
-		t.Fatalf("not ready: %s", obs.ObservedState)
-	}
-
-	got, err := os.ReadFile(placeholder)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, body) {
-		t.Fatalf("плейсхолдер не заменён настоящими весами: %q", got)
 	}
 }
 
@@ -236,34 +192,6 @@ func TestReconcileGatedModelDoesNotBlockOthers(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(root, "models", "diffusion_models", "public.safetensors"))
 	if err != nil || !bytes.Equal(got, body) {
 		t.Fatalf("public model must be downloaded despite the failed ones: %v %q", err, got)
-	}
-}
-
-func TestReconcileGatedModelPlacedByUser(t *testing.T) {
-	root := t.TempDir()
-	var hits atomic.Int64
-	srv := gatedServer(&hits)
-	defer srv.Close()
-
-	spec := &client.AgentContentSpec{
-		Models: []client.ContentModel{{URL: srv.URL + "/flux.safetensors", Type: "diffusion_models", Name: "flux.safetensors"}},
-	}
-	m := newTestManager()
-	if obs := settle(t, m, spec, containerWith(root)); obs.ObservedState != client.ContentError {
-		t.Fatalf("first pass: want error, got %s", obs.ObservedState)
-	}
-
-	target := filepath.Join(root, "models", "diffusion_models", "flux.safetensors")
-	if err := os.WriteFile(target, []byte("weights from the user"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	before := hits.Load()
-
-	if obs := settle(t, m, spec, containerWith(root)); obs.ObservedState != client.ContentReady {
-		t.Fatalf("after the user placed the file: want ready, got %s (%v)", obs.ObservedState, obs.LastError)
-	}
-	if extra := hits.Load() - before; extra != 0 {
-		t.Errorf("model is in place, but the agent went to the link again (%d extra request(s))", extra)
 	}
 }
 
@@ -709,51 +637,6 @@ func TestHTMLPageInsteadOfModelRejected(t *testing.T) {
 	}
 }
 
-func TestConflictingSHAForOneTargetIsAnError(t *testing.T) {
-	root := t.TempDir()
-	var hits atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
-		_, _ = w.Write([]byte("weights"))
-	}))
-	defer srv.Close()
-	spec := &client.AgentContentSpec{Models: []client.ContentModel{
-		{URL: srv.URL + "/a", Type: "vae", Name: "m.bin", SHA256: strings.Repeat("a", 64)},
-		{URL: srv.URL + "/b", Type: "vae", Name: "m.bin", SHA256: strings.Repeat("b", 64)},
-	}}
-
-	obs := settle(t, newTestManager(), spec, containerWith(root))
-
-	if obs.ObservedState != client.ContentError || obs.LastError == nil || !strings.Contains(*obs.LastError, "sha256") {
-		t.Fatalf("want a conflict error, got %s %v", obs.ObservedState, obs.LastError)
-	}
-	if hits.Load() != 0 {
-		t.Fatalf("conflicting model must not be downloaded, hits=%d", hits.Load())
-	}
-}
-
-func TestDuplicateModelDownloadedOnce(t *testing.T) {
-	root := t.TempDir()
-	body := []byte("weights")
-	sum := sha256.Sum256(body)
-	var hits atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
-		_, _ = w.Write(body)
-	}))
-	defer srv.Close()
-	spec := &client.AgentContentSpec{Models: []client.ContentModel{
-		{URL: srv.URL + "/a", Type: "vae", Name: "m.bin"},
-		{URL: srv.URL + "/a", Type: "vae", Name: "m.bin", SHA256: hex.EncodeToString(sum[:])},
-	}}
-
-	obs := settle(t, newTestManager(), spec, containerWith(root))
-
-	if obs.ObservedState != client.ContentReady || hits.Load() != 1 {
-		t.Fatalf("want one download, got %s hits=%d", obs.ObservedState, hits.Load())
-	}
-}
-
 func TestVerifiedModelIsNotHashedAgain(t *testing.T) {
 	root := t.TempDir()
 	body := []byte("weights-one")
@@ -980,24 +863,6 @@ func TestDetailIsClippedForTheBackend(t *testing.T) {
 	}
 }
 
-func TestClipKeepsWholeRunes(t *testing.T) {
-	cases := []struct {
-		in   string
-		n    int
-		want string
-	}{
-		{"abc", 5, "abc"},
-		{"абв", 2, "аб"},
-		{"a😀b", 2, "a"},
-		{"a😀b", 3, "a😀"},
-	}
-	for _, c := range cases {
-		if got := Clip(c.in, c.n); got != c.want {
-			t.Errorf("Clip(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
-		}
-	}
-}
-
 func TestRangedPartsUseTheRedirectTarget(t *testing.T) {
 	body := randomBody(1 << 20)
 	var mu sync.Mutex
@@ -1093,5 +958,28 @@ func TestEmptyModelIsAnError(t *testing.T) {
 
 	if obs.ObservedState != client.ContentError || hits.Load() != 1 {
 		t.Fatalf("empty model must fail and wait for the backoff, got %s hits=%d", obs.ObservedState, hits.Load())
+	}
+}
+
+func TestRepoURLIsNeverAnOption(t *testing.T) {
+	bin := t.TempDir()
+	argsFile := filepath.Join(t.TempDir(), "args")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\nfor a; do last=$a; done\nmkdir -p \"$last\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	root := t.TempDir()
+	spec := &client.AgentContentSpec{Repos: []client.ContentRepo{{URL: "--upload-pack=touch /tmp/pwned", Ref: "main", Dest: "custom_nodes/x"}}}
+
+	obs := settle(t, newTestManager(), spec, containerWith(root))
+
+	raw, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("git not called: %v (%+v)", err, obs)
+	}
+	args := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(args) < 3 || args[len(args)-3] != "--" || args[len(args)-2] != spec.Repos[0].URL {
+		t.Fatalf("url must follow --, git got %q", args)
 	}
 }

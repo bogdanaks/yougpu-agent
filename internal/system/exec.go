@@ -6,8 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"time"
+
+	"github.com/bogdanaks/yougpu-agent/internal/fetch"
 )
+
+const maxStderr = 512
 
 type Executor interface {
 	Run(ctx context.Context, timeout time.Duration, name string, args ...string) (stdout string, err error)
@@ -33,17 +38,22 @@ func (e *CmdExecutor) Run(ctx context.Context, timeout time.Duration, name strin
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	e.log.Debug("exec", "cmd", name, "args", args)
+	shown := withoutEnvValues(args)
+	e.log.Debug("exec", "cmd", name, "args", shown)
 	err := cmd.Run()
 	if err != nil {
-		return stdout.String(), fmt.Errorf("%s %v: %w (stderr: %s)", name, args, err, truncate(stderr.String(), 512))
+		return stdout.String(), fmt.Errorf("%s %s: %w (stderr: %s)", name, strings.Join(shown, " "), err, fetch.Clip(stderr.String(), maxStderr))
 	}
 	return stdout.String(), nil
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+func withoutEnvValues(args []string) []string {
+	shown := make([]string, len(args))
+	for i, arg := range args {
+		shown[i] = arg
+		if i > 0 && (args[i-1] == "-e" || args[i-1] == "--env") {
+			shown[i], _, _ = strings.Cut(arg, "=")
+		}
 	}
-	return s[:n] + "...(truncated)"
+	return shown
 }
