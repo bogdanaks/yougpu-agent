@@ -82,7 +82,7 @@ func main() {
 	contentMgr := content.New(logger)
 	sshKeysMgr := sshkeys.NewManager(logger)
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
-	stateMgr := state.New(cfg.StateDir, logger)
+	stateMgr := state.New(cfg.StateDir, httpClient, logger)
 	credsProvider := sts.NewProvider(httpClient, diskMgr, logger, cfg.CredsRefreshThreshold, cfg.CredsPeriodicInterval)
 
 	a := agent.New(agent.Config{

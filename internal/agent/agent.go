@@ -89,6 +89,7 @@ type LifecycleManager interface {
 type StateManager interface {
 	Restore(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec) (bool, *client.AgentStateObserved)
 	Save(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec, stopErr error) *client.AgentStateObserved
+	Checkpoint(ctx context.Context, spec *client.AgentStateSpec, container *client.AgentContainerSpec)
 	Outcome() *client.AgentStateObserved
 	SetReporter(func(context.Context, client.AgentStateObserved))
 	SetNotify(func())
@@ -511,6 +512,9 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 	}
 	if work.Err() != nil {
 		return nil
+	}
+	if a.cfg.State != nil && spec.State != nil && spec.State.Checkpoint != nil {
+		a.cfg.State.Checkpoint(work, spec.State, spec.Container)
 	}
 
 	var contentObserved *client.AgentContentObserved

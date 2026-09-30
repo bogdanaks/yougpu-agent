@@ -298,6 +298,7 @@ type fakeState struct {
 	stopErr   error
 	restores  []*client.AgentStateSpec
 	reporter  func(context.Context, client.AgentStateObserved)
+	ckptCtx   context.Context
 }
 
 func (f *fakeState) Restore(_ context.Context, spec *client.AgentStateSpec, _ *client.AgentContainerSpec) (bool, *client.AgentStateObserved) {
@@ -323,6 +324,19 @@ func (f *fakeState) Save(_ context.Context, _ *client.AgentStateSpec, _ *client.
 		return f.saveObs
 	}
 	return &client.AgentStateObserved{ObservedState: client.StateSaved}
+}
+
+func (f *fakeState) Checkpoint(ctx context.Context, _ *client.AgentStateSpec, _ *client.AgentContainerSpec) {
+	f.rec.add("checkpoint")
+	f.mu.Lock()
+	f.ckptCtx = ctx
+	f.mu.Unlock()
+}
+
+func (f *fakeState) checkpointContext() context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ckptCtx
 }
 
 func (f *fakeState) Outcome() *client.AgentStateObserved {
@@ -772,6 +786,71 @@ func TestSaveInProgressKeepsTerminationSyncing(t *testing.T) {
 		if !hooks.AfterStop(context.Background(), nil) {
 			t.Fatalf("%s must let termination continue", state)
 		}
+	}
+}
+
+func checkpointSpec() *client.AgentSpec {
+	spec := specWithWork()
+	spec.State = &client.AgentStateSpec{
+		Save:       &client.StateSave{UploadURL: "http://b2/put"},
+		Checkpoint: &client.StateCheckpoint{Include: []string{"user"}, EverySec: 600, MaxBytes: 1 << 20},
+	}
+	return spec
+}
+
+func TestCheckpointOfferedOnEveryAlivePass(t *testing.T) {
+	rec := &recorder{}
+	st := &fakeState{rec: rec, restoreOK: true}
+	a, _ := stateAgent(rec, st)
+	spec := checkpointSpec()
+	a.lastSpec.Store(spec)
+
+	for range 2 {
+		if err := a.handleSpec(context.Background(), spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	calls := 0
+	for _, e := range rec.list() {
+		if e == "checkpoint" {
+			calls++
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("checkpoint must be offered on every pass, got %v", rec.list())
+	}
+	ctx := st.checkpointContext()
+	if ctx.Err() != nil {
+		t.Fatal("checkpoint got a cancelled context")
+	}
+	a.stopAlive()
+	if ctx.Err() == nil {
+		t.Fatal("deletion must cancel a running checkpoint")
+	}
+}
+
+func TestNoCheckpointWithoutPermissionOrOnDeletion(t *testing.T) {
+	rec := &recorder{}
+	a, _ := stateAgent(rec, &fakeState{rec: rec, restoreOK: true})
+	spec := checkpointSpec()
+	spec.State.Checkpoint = nil
+	a.lastSpec.Store(spec)
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	gone := deletion(checkpointSpec())
+	a.lastSpec.Store(gone)
+	if err := a.handleSpec(context.Background(), gone); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec.index("checkpoint") >= 0 {
+		t.Fatalf("checkpoint offered without permission or during deletion: %v", rec.list())
+	}
+	if rec.index("save") < 0 {
+		t.Fatalf("deletion must still save the state: %v", rec.list())
 	}
 }
 

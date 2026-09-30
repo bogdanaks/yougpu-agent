@@ -89,6 +89,25 @@ func TestTunnelStatusIsOptional(t *testing.T) {
 	}
 }
 
+func TestStateSpecCarriesOverlayAndCheckpoint(t *testing.T) {
+	var spec AgentStateSpec
+	raw := `{"include":["user"],"restore":null,"overlay":{"url":"https://b2/o","sha256":"abc","size_bytes":45,"include":["user"]},"checkpoint":{"include":["user"],"every_sec":600,"max_bytes":268435456}}`
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		t.Fatal(err)
+	}
+	o := spec.Overlay
+	if spec.Restore != nil || o == nil || o.URL != "https://b2/o" || o.SHA256 != "abc" || o.SizeBytes != 45 || len(o.Include) != 1 || o.Include[0] != "user" {
+		t.Fatalf("overlay %+v", o)
+	}
+	c := spec.Checkpoint
+	if c == nil || len(c.Include) != 1 || c.Include[0] != "user" || c.EverySec != 600 || c.MaxBytes != 268435456 {
+		t.Fatalf("checkpoint %+v", c)
+	}
+	if err := json.Unmarshal([]byte(`{"include":["user"],"overlay":null,"checkpoint":null}`), &spec); err != nil || spec.Overlay != nil || spec.Checkpoint != nil {
+		t.Fatalf("null overlay and checkpoint: %+v %v", spec, err)
+	}
+}
+
 func TestStateSpecIgnoresFreezeCommand(t *testing.T) {
 	var spec AgentStateSpec
 	if err := json.Unmarshal([]byte(`{"include":["user"],"freeze_command":["yougpu-freeze"],"pending":false}`), &spec); err != nil {

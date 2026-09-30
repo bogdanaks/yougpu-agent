@@ -15,11 +15,13 @@ type AgentSpec struct {
 }
 
 type AgentStateSpec struct {
-	Include []string      `json:"include"`
-	Exclude []string      `json:"exclude"`
-	Pending bool          `json:"pending"`
-	Restore *StateRestore `json:"restore"`
-	Save    *StateSave    `json:"save"`
+	Include    []string         `json:"include"`
+	Exclude    []string         `json:"exclude"`
+	Pending    bool             `json:"pending"`
+	Restore    *StateRestore    `json:"restore"`
+	Overlay    *StateOverlay    `json:"overlay"`
+	Save       *StateSave       `json:"save"`
+	Checkpoint *StateCheckpoint `json:"checkpoint"`
 }
 
 type StateRestore struct {
@@ -28,8 +30,30 @@ type StateRestore struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
+type StateOverlay struct {
+	StateRestore
+	Include []string `json:"include"`
+}
+
 type StateSave struct {
 	UploadURL string `json:"upload_url"`
+}
+
+type StateCheckpoint struct {
+	Include  []string `json:"include"`
+	EverySec int64    `json:"every_sec"`
+	MaxBytes int64    `json:"max_bytes"`
+}
+
+type CheckpointUpload struct {
+	Key       string `json:"key"`
+	UploadURL string `json:"upload_url"`
+}
+
+type CheckpointCommit struct {
+	Key       string `json:"key"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 type AgentSSHSpec struct {

@@ -24,31 +24,41 @@ import (
 )
 
 const (
-	restoredMarker  = "state_restored"
-	savedMarker     = "state_saved"
-	skippedMarker   = "state_save_skipped"
-	failedMarker    = "state_save_failed"
-	saveStartMarker = "state_save_started"
-	restoreDir      = ".yougpu-restore"
-	maxUnpacked     = 20 << 30
-	maxEntries      = 500_000
-	packedMarker    = "state_packed"
-	inArchive       = "state-in.tar.zst"
-	outArchive      = "state-out.tar.zst"
-	venvDir         = ".venv"
-	maxUpload       = 5_000_000_000
-	maxError        = 1024
-	restoreTimeout  = 30 * time.Minute
-	saveTimeout     = 30 * time.Minute
-	saveWindow      = 30 * time.Minute
-	maxRetryDelay   = 2 * time.Minute
-	idleTimeout     = time.Minute
-	restoringEvery  = 30 * time.Second
-	retryDelay      = 5 * time.Second
+	restoredMarker    = "state_restored"
+	savedMarker       = "state_saved"
+	skippedMarker     = "state_save_skipped"
+	failedMarker      = "state_save_failed"
+	saveStartMarker   = "state_save_started"
+	restoreDir        = ".yougpu-restore"
+	maxUnpacked       = 20 << 30
+	maxEntries        = 500_000
+	packedMarker      = "state_packed"
+	inArchive         = "state-in.tar.zst"
+	outArchive        = "state-out.tar.zst"
+	overlayArchive    = "state-overlay.tar.zst"
+	checkpointArchive = "state-checkpoint.tar.zst"
+	venvDir           = ".venv"
+	maxUpload         = 5_000_000_000
+	maxError          = 1024
+	restoreTimeout    = 30 * time.Minute
+	saveTimeout       = 30 * time.Minute
+	checkpointTimeout = 15 * time.Minute
+	saveWindow        = 30 * time.Minute
+	maxRetryDelay     = 2 * time.Minute
+	idleTimeout       = time.Minute
+	restoringEvery    = 30 * time.Second
+	retryDelay        = 5 * time.Second
 )
+
+type Backend interface {
+	CheckpointURL(ctx context.Context) (*client.CheckpointUpload, error)
+	CommitCheckpoint(ctx context.Context, commit client.CheckpointCommit) error
+}
 
 type Manager struct {
 	stateDir       string
+	backend        Backend
+	now            func() time.Time
 	http           *http.Client
 	log            *slog.Logger
 	reporter       func(context.Context, client.AgentStateObserved)
@@ -65,13 +75,18 @@ type Manager struct {
 	uploadErr      error
 	nextUpload     time.Time
 
-	mu  sync.Mutex
-	job *restoreJob
+	checkpointTimeout time.Duration
+
+	mu            sync.Mutex
+	job           *restoreJob
+	checkpoint    *checkpointJob
+	checkpointAt  time.Time
+	checkpointSum string
+	sealed        bool
 }
 
 type restoreJob struct {
-	sha     string
-	size    int64
+	key     string
 	cancel  context.CancelFunc
 	stopped atomic.Bool
 	done    chan struct{}
@@ -83,19 +98,22 @@ type finalError struct{ err error }
 func (e finalError) Error() string { return e.err.Error() }
 func (e finalError) Unwrap() error { return e.err }
 
-func New(stateDir string, log *slog.Logger) *Manager {
+func New(stateDir string, backend Backend, log *slog.Logger) *Manager {
 	return &Manager{
-		stateDir:       stateDir,
-		http:           fetch.NewHTTPClient(),
-		log:            log,
-		retryDelay:     retryDelay,
-		idle:           idleTimeout,
-		restoreTimeout: restoreTimeout,
-		saveTimeout:    saveTimeout,
-		saveWindow:     saveWindow,
-		restoringEvery: restoringEvery,
-		limits:         Limits{Bytes: maxUnpacked, Entries: maxEntries},
-		maxUpload:      maxUpload,
+		stateDir:          stateDir,
+		backend:           backend,
+		now:               time.Now,
+		http:              fetch.NewHTTPClient(),
+		log:               log,
+		retryDelay:        retryDelay,
+		idle:              idleTimeout,
+		restoreTimeout:    restoreTimeout,
+		saveTimeout:       saveTimeout,
+		checkpointTimeout: checkpointTimeout,
+		saveWindow:        saveWindow,
+		restoringEvery:    restoringEvery,
+		limits:            Limits{Bytes: maxUnpacked, Entries: maxEntries},
+		maxUpload:         maxUpload,
 	}
 }
 
@@ -133,7 +151,7 @@ func (m *Manager) Restore(ctx context.Context, spec *client.AgentStateSpec, cont
 	if spec.Pending {
 		return false, &client.AgentStateObserved{ObservedState: client.StateWaiting}
 	}
-	if spec.Restore == nil {
+	if spec.Restore == nil && spec.Overlay == nil {
 		if err := os.WriteFile(m.marker(restoredMarker), []byte("none"), 0o644); err != nil {
 			return false, m.failed(ctx, client.StateRestoreFailed, err)
 		}
@@ -149,8 +167,9 @@ func (m *Manager) Restore(ctx context.Context, spec *client.AgentStateSpec, cont
 func (m *Manager) startRestore(ctx context.Context, spec *client.AgentStateSpec, root string) *client.AgentStateObserved {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	key := restoreKey(spec)
 	if j := m.job; j != nil {
-		same := j.sha == spec.Restore.SHA256 && j.size == spec.Restore.SizeBytes
+		same := j.key == key
 		select {
 		case <-j.done:
 			if same && j.result != nil {
@@ -166,7 +185,7 @@ func (m *Manager) startRestore(ctx context.Context, spec *client.AgentStateSpec,
 		}
 	}
 	jobCtx, cancel := context.WithTimeout(ctx, m.restoreTimeout)
-	j := &restoreJob{sha: spec.Restore.SHA256, size: spec.Restore.SizeBytes, cancel: cancel, done: make(chan struct{})}
+	j := &restoreJob{key: key, cancel: cancel, done: make(chan struct{})}
 	m.job = j
 	go m.runRestore(ctx, jobCtx, j, spec, root)
 	return &client.AgentStateObserved{ObservedState: client.StateRestoring}
@@ -182,12 +201,12 @@ func (m *Manager) runRestore(parent, ctx context.Context, j *restoreJob, spec *c
 		return
 	}
 	if err == nil {
-		err = os.WriteFile(m.marker(restoredMarker), []byte(spec.Restore.SHA256), 0o644)
+		err = os.WriteFile(m.marker(restoredMarker), []byte(j.key), 0o644)
 	}
 	if err != nil {
 		j.result = m.failed(parent, client.StateRestoreFailed, err)
 	} else {
-		m.log.Info("workspace state restored", "bytes", spec.Restore.SizeBytes)
+		m.log.Info("workspace state restored", "archive", j.key)
 		j.result = m.report(parent, client.AgentStateObserved{ObservedState: client.StateRestored})
 	}
 	if m.notify != nil {
@@ -231,26 +250,38 @@ func (m *Manager) stopRestore() {
 	<-j.done
 }
 
+func restoreKey(spec *client.AgentStateSpec) string {
+	key := archiveKey(spec.Restore)
+	if spec.Overlay != nil {
+		key += "+" + archiveKey(&spec.Overlay.StateRestore)
+	}
+	return key
+}
+
+func archiveKey(a *client.StateRestore) string {
+	if a == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%s:%d", a.SHA256, a.SizeBytes)
+}
+
 func (m *Manager) restore(ctx context.Context, spec *client.AgentStateSpec, root string) error {
 	if err := os.MkdirAll(root, 0o777); err != nil {
 		return err
 	}
-	archive := m.marker(inArchive)
-	if err := os.Remove(archive); err != nil && !os.IsNotExist(err) {
-		return err
+	full, overlay := m.marker(inArchive), m.marker(overlayArchive)
+	defer os.Remove(full)
+	defer os.Remove(overlay)
+	if spec.Restore != nil {
+		if err := m.fetchVerified(ctx, spec.Restore, full); err != nil {
+			return err
+		}
 	}
-	defer os.Remove(archive)
-	if err := m.fetchArchive(ctx, spec.Restore, archive); err != nil {
-		return err
+	if spec.Overlay != nil {
+		if err := m.fetchVerified(ctx, &spec.Overlay.StateRestore, overlay); err != nil {
+			return fmt.Errorf("overlay: %w", err)
+		}
 	}
-	if err := verify(ctx, archive, spec.Restore.SHA256); err != nil {
-		return err
-	}
-	f, err := os.Open(archive)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
 	tmp := filepath.Join(root, restoreDir)
 	if err := os.RemoveAll(tmp); err != nil {
 		return err
@@ -259,13 +290,51 @@ func (m *Manager) restore(ctx context.Context, spec *client.AgentStateSpec, root
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := Unpack(fetch.CtxReader(ctx, f), tmp, spec.Include, m.limits); err != nil {
+	if spec.Restore != nil {
+		if err := m.unpackFile(ctx, full, tmp, spec.Include); err != nil {
+			return err
+		}
+	}
+	if spec.Overlay != nil {
+		for _, dir := range spec.Overlay.Include {
+			rel, err := safeRel(dir)
+			if err != nil {
+				return fmt.Errorf("overlay: %w", err)
+			}
+			if err := os.RemoveAll(filepath.Join(tmp, filepath.FromSlash(rel))); err != nil {
+				return err
+			}
+		}
+		if err := m.unpackFile(ctx, overlay, tmp, spec.Overlay.Include); err != nil {
+			return fmt.Errorf("overlay: %w", err)
+		}
+	}
+	return moveInto(tmp, root)
+}
+
+func (m *Manager) fetchVerified(ctx context.Context, spec *client.StateRestore, dest string) error {
+	if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := m.fetchArchive(ctx, spec, dest); err != nil {
+		return err
+	}
+	return verify(ctx, dest, spec.SHA256)
+}
+
+func (m *Manager) unpackFile(ctx context.Context, archive, dest string, include []string) error {
+	f, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := Unpack(fetch.CtxReader(ctx, f), dest, include, m.limits); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("state unpack: did not finish in %s", m.restoreTimeout)
 		}
 		return fmt.Errorf("state unpack: %w", err)
 	}
-	return moveInto(tmp, root)
+	return nil
 }
 
 func (m *Manager) fetchArchive(ctx context.Context, spec *client.StateRestore, dest string) error {
@@ -414,6 +483,7 @@ func (m *Manager) Save(ctx context.Context, spec *client.AgentStateSpec, contain
 		return nil
 	}
 	m.stopRestore()
+	m.stopCheckpoints()
 	if obs := m.Outcome(); obs != nil {
 		return obs
 	}
@@ -529,10 +599,10 @@ func (m *Manager) packed(archive string) (string, int64, error) {
 }
 
 func (m *Manager) pack(ctx context.Context, spec *client.AgentStateSpec, root, archive string) (string, int64, error) {
-	sum, size, err := m.packToFile(ctx, root, spec.Include, spec.Exclude, archive)
+	sum, size, err := m.packToFile(ctx, root, spec.Include, spec.Exclude, archive, m.maxUpload)
 	if errors.Is(err, errTooLarge) {
 		m.log.Warn("workspace state is too large, saving it without .venv", "err", err)
-		sum, size, err = m.packToFile(ctx, root, spec.Include, append(slices.Clone(spec.Exclude), venvDir), archive)
+		sum, size, err = m.packToFile(ctx, root, spec.Include, append(slices.Clone(spec.Exclude), venvDir), archive, m.maxUpload)
 	}
 	if err != nil {
 		os.Remove(archive)
@@ -552,13 +622,13 @@ func (m *Manager) dropArchive() {
 	}
 }
 
-func (m *Manager) packToFile(ctx context.Context, root string, include, exclude []string, dest string) (string, int64, error) {
+func (m *Manager) packToFile(ctx context.Context, root string, include, exclude []string, dest string, limit int64) (string, int64, error) {
 	f, err := os.Create(dest)
 	if err != nil {
 		return "", 0, err
 	}
 	h := sha256.New()
-	out := &limitedWriter{ctx: ctx, w: io.MultiWriter(f, h), limit: m.maxUpload}
+	out := &limitedWriter{ctx: ctx, w: io.MultiWriter(f, h), limit: limit}
 	if err := Pack(root, include, exclude, out, m.limits); err != nil {
 		f.Close()
 		return "", 0, err

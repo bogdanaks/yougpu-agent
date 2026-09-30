@@ -56,7 +56,7 @@ func (r *recorder) count(state string) int {
 func newManager(t *testing.T) (*Manager, *recorder) {
 	t.Helper()
 	rec := &recorder{}
-	m := New(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(t.TempDir(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	m.retryDelay = time.Millisecond
 	m.restoringEvery = 10 * time.Millisecond
 	m.saveWindow = time.Hour
@@ -380,6 +380,178 @@ func TestRestoreMergesIntoWorkspace(t *testing.T) {
 	}
 }
 
+func serveArchives(t *testing.T, archives map[string][]byte) (*httptest.Server, func(string) int) {
+	t.Helper()
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		body, ok := archives[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func(path string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits[path]
+	}
+}
+
+func overlaySpec(url, sum string, size int) *client.StateOverlay {
+	return &client.StateOverlay{StateRestore: client.StateRestore{URL: url, SHA256: sum, SizeBytes: int64(size)}, Include: []string{"user"}}
+}
+
+func (m *Manager) currentRestore() *restoreJob {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.job
+}
+
+func TestOverlayReplacesUserOfFullArchive(t *testing.T) {
+	full, fullSum := archiveOf(t, map[string]string{
+		"custom_nodes/pack/__init__.py":       "nodes",
+		"comfyui.db":                          "db",
+		"user/default/tabs.json":              "full",
+		"user/default/workflows/deleted.json": "old",
+	})
+	overlay, overlaySum := archiveOf(t, map[string]string{
+		"user/default/tabs.json":          "checkpoint",
+		"user/default/workflows/new.json": "new",
+		"custom_nodes/pack/__init__.py":   "stale",
+	})
+	srv, hits := serveArchives(t, map[string][]byte{"/full": full, "/overlay": overlay})
+	m, _ := newManager(t)
+	root := t.TempDir()
+	writeFile(t, root, "models/vae/m.bin", "weights", 0o644)
+	spec := restoreSpec(srv.URL+"/full", fullSum, len(full))
+	spec.Overlay = overlaySpec(srv.URL+"/overlay", overlaySum, len(overlay))
+
+	ok, obs := restoreWithin(t, m, spec, root)
+
+	if !ok || obs.ObservedState != client.StateRestored {
+		t.Fatalf("ok=%v obs=%+v", ok, obs)
+	}
+	if readFile(t, root, "custom_nodes/pack/__init__.py") != "nodes" || readFile(t, root, "comfyui.db") != "db" || readFile(t, root, "models/vae/m.bin") != "weights" {
+		t.Fatal("overlay must touch only its own folders")
+	}
+	if readFile(t, root, "user/default/tabs.json") != "checkpoint" || readFile(t, root, "user/default/workflows/new.json") != "new" {
+		t.Fatal("overlay not applied")
+	}
+	if exists(root, "user/default/workflows/deleted.json") {
+		t.Fatal("file deleted during the session came back from the full archive")
+	}
+	if hits("/full") != 1 || hits("/overlay") != 1 {
+		t.Fatalf("full=%d overlay=%d downloads", hits("/full"), hits("/overlay"))
+	}
+	if exists(root, restoreDir) || exists(m.stateDir, inArchive) || exists(m.stateDir, overlayArchive) {
+		t.Fatal("temporary files left behind")
+	}
+}
+
+func TestOverlayWithoutFullArchive(t *testing.T) {
+	overlay, overlaySum := archiveOf(t, map[string]string{"user/default/tabs.json": "checkpoint"})
+	srv, _ := serveArchives(t, map[string][]byte{"/overlay": overlay})
+	m, _ := newManager(t)
+	root := t.TempDir()
+	spec := &client.AgentStateSpec{Include: testInclude, Exclude: testExclude, Overlay: overlaySpec(srv.URL+"/overlay", overlaySum, len(overlay))}
+
+	ok, obs := restoreWithin(t, m, spec, root)
+
+	if !ok || obs.ObservedState != client.StateRestored {
+		t.Fatalf("ok=%v obs=%+v", ok, obs)
+	}
+	if readFile(t, root, "user/default/tabs.json") != "checkpoint" {
+		t.Fatal("overlay not applied")
+	}
+	if !m.has(restoredMarker) {
+		t.Fatal("restored marker missing")
+	}
+}
+
+func TestTamperedOverlayFailsTheRestore(t *testing.T) {
+	full, fullSum := archiveOf(t, map[string]string{"custom_nodes/pack/__init__.py": "nodes"})
+	overlay, _ := archiveOf(t, map[string]string{"user/default/tabs.json": "checkpoint"})
+	srv, hits := serveArchives(t, map[string][]byte{"/full": full, "/overlay": overlay})
+	m, _ := newManager(t)
+	root := t.TempDir()
+	spec := restoreSpec(srv.URL+"/full", fullSum, len(full))
+	spec.Overlay = overlaySpec(srv.URL+"/overlay", strings.Repeat("0", 64), len(overlay))
+
+	ok, obs := restoreWithin(t, m, spec, root)
+
+	if ok || obs.ObservedState != client.StateRestoreFailed || obs.LastError == nil || !strings.Contains(*obs.LastError, "sha256 mismatch") {
+		t.Fatalf("ok=%v obs=%+v", ok, obs)
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 0 {
+		t.Fatalf("failed restore left %v in the workspace", entries)
+	}
+	if hits("/overlay") != 1 {
+		t.Fatalf("overlay that fails its checksum must not be downloaded again, hits=%d", hits("/overlay"))
+	}
+	if m.has(restoredMarker) {
+		t.Fatal("failed restore marked as restored")
+	}
+}
+
+func TestOverlayIsPartOfTheRestoreIdentity(t *testing.T) {
+	full, fullSum := archiveOf(t, map[string]string{"user/default/tabs.json": "full"})
+	first, firstSum := archiveOf(t, map[string]string{"user/default/tabs.json": "first"})
+	second, secondSum := archiveOf(t, map[string]string{"user/default/tabs.json": "second"})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/full":
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write(full)
+		case "/first":
+			_, _ = w.Write(first)
+		case "/second":
+			_, _ = w.Write(second)
+		}
+	}))
+	defer srv.Close()
+	m, _ := newManager(t)
+	root := t.TempDir()
+	spec := func(path, sum string, size int) *client.AgentStateSpec {
+		s := restoreSpec(srv.URL+"/full", fullSum, len(full))
+		s.Overlay = overlaySpec(srv.URL+path, sum, size)
+		return s
+	}
+
+	m.Restore(context.Background(), spec("/first", firstSum, len(first)), workspace(root))
+	running := m.currentRestore()
+	if ok, obs := m.Restore(context.Background(), spec("/first", firstSum, len(first)), workspace(root)); ok || obs.ObservedState != client.StateRestoring || m.currentRestore() != running {
+		t.Fatalf("same archives must keep the running restore: ok=%v obs=%+v", ok, obs)
+	}
+
+	changed := spec("/second", secondSum, len(second))
+	m.Restore(context.Background(), changed, workspace(root))
+	if m.currentRestore() == running {
+		t.Fatal("another overlay must restart the restore")
+	}
+	select {
+	case <-running.done:
+	default:
+		t.Fatal("previous restore still running")
+	}
+	close(release)
+
+	ok, obs := restoreWithin(t, m, changed, root)
+	if !ok || obs.ObservedState != client.StateRestored || readFile(t, root, "user/default/tabs.json") != "second" {
+		t.Fatalf("ok=%v obs=%+v", ok, obs)
+	}
+}
+
 func TestRestoreGivesUpAtDeadline(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
@@ -416,7 +588,7 @@ func TestRestoreDownloadFailsWhenServerGoesSilent(t *testing.T) {
 
 func TestRestoreErrorsDoNotLeakSignedURL(t *testing.T) {
 	var logs bytes.Buffer
-	m := New(t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(t.TempDir(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	m.retryDelay = time.Millisecond
 	m.restoreTimeout = 300 * time.Millisecond
 
@@ -646,7 +818,7 @@ func TestSavePauseGrowsAndWakesTheAgent(t *testing.T) {
 }
 
 func TestSaveLimitIsTheB2ObjectLimit(t *testing.T) {
-	m := New(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := New(t.TempDir(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if m.maxUpload != 5_000_000_000 {
 		t.Fatalf("max upload %d, B2 PutObject takes up to 5 000 000 000 bytes", m.maxUpload)
 	}
@@ -742,7 +914,7 @@ func TestRejectedSaveReportsOnlyTheErrorCode(t *testing.T) {
 
 func TestSaveErrorsDoNotLeakSignedURL(t *testing.T) {
 	var logs bytes.Buffer
-	m := New(t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
+	m := New(t.TempDir(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	m.retryDelay = time.Millisecond
 	m.saveWindow = 0
 	ranHere(t, m)

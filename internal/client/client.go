@@ -120,12 +120,35 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	return nil
 }
 
-func IsGone(err error) bool {
-	var httpErr *HTTPError
-	if errors.As(err, &httpErr) {
-		return httpErr.Status == http.StatusGone
+func (c *Client) CheckpointURL(ctx context.Context) (*CheckpointUpload, error) {
+	var resp CheckpointUpload
+	if err := c.do(ctx, http.MethodPost, "/state/checkpoint-url", nil, &resp); err != nil {
+		return nil, fmt.Errorf("checkpoint url: %w", err)
 	}
-	return false
+	if resp.Key == "" || resp.UploadURL == "" {
+		return nil, errors.New("checkpoint url: empty key or upload_url in response")
+	}
+	return &resp, nil
+}
+
+func (c *Client) CommitCheckpoint(ctx context.Context, commit CheckpointCommit) error {
+	if err := c.do(ctx, http.MethodPost, "/state/checkpoints", commit, nil); err != nil {
+		return fmt.Errorf("commit checkpoint: %w", err)
+	}
+	return nil
+}
+
+func IsGone(err error) bool {
+	return hasStatus(err, http.StatusGone)
+}
+
+func IsConflict(err error) bool {
+	return hasStatus(err, http.StatusConflict)
+}
+
+func hasStatus(err error, status int) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.Status == status
 }
 
 func (c *Client) GetStorageCredentials(ctx context.Context) (*StorageCredentials, error) {
