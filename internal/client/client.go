@@ -120,9 +120,9 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) CheckpointURL(ctx context.Context) (*CheckpointUpload, error) {
+func (c *Client) CheckpointURL(ctx context.Context, archive CheckpointRequest) (*CheckpointUpload, error) {
 	var resp CheckpointUpload
-	if err := c.do(ctx, http.MethodPost, "/state/checkpoint-url", nil, &resp); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/state/checkpoint-url", archive, &resp); err != nil {
 		return nil, fmt.Errorf("checkpoint url: %w", err)
 	}
 	if resp.Key == "" || resp.UploadURL == "" {
@@ -146,24 +146,22 @@ func IsConflict(err error) bool {
 	return hasStatus(err, http.StatusConflict)
 }
 
+func IsBadRequest(err error) bool {
+	return hasStatus(err, http.StatusBadRequest)
+}
+
 func hasStatus(err error, status int) bool {
 	var httpErr *HTTPError
 	return errors.As(err, &httpErr) && httpErr.Status == status
 }
 
-func (c *Client) GetStorageCredentials(ctx context.Context) (*StorageCredentials, error) {
+func (c *Client) GetStorageCredentials(ctx context.Context, driveID string) (*StorageCredentials, error) {
 	var resp StorageCredentials
-	if err := c.do(ctx, http.MethodPost, "/storage/credentials", nil, &resp); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/storage/credentials", StorageCredentialsRequest{DriveID: driveID}, &resp); err != nil {
 		return nil, fmt.Errorf("get storage credentials: %w", err)
 	}
-	if resp.AccessKey == "" {
-		return nil, errors.New("get storage credentials: empty access key in response")
-	}
-	if resp.ExpiresAt.IsZero() {
-		return nil, errors.New("get storage credentials: missing expiresAt in response")
-	}
-	if resp.CredentialID == "" {
-		resp.CredentialID = resp.AccessKey
+	if resp.AccessKey == "" || resp.SecretKey == "" || resp.Endpoint == "" {
+		return nil, errors.New("get storage credentials: incomplete key in response")
 	}
 	return &resp, nil
 }

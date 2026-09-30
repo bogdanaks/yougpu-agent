@@ -18,7 +18,6 @@ type Systemd interface {
 	Disable(ctx context.Context, unit string) error
 	Start(ctx context.Context, unit string) error
 	Stop(ctx context.Context, unit string) error
-	Restart(ctx context.Context, unit string) error
 	IsActive(ctx context.Context, unit string) (bool, error)
 	InvocationID(ctx context.Context, unit string) (string, error)
 	Poweroff(ctx context.Context) error
@@ -55,11 +54,6 @@ func (s *Systemctl) Start(ctx context.Context, unit string) error {
 
 func (s *Systemctl) Stop(ctx context.Context, unit string) error {
 	_, err := s.exec.Run(ctx, stopTimeout, "systemctl", "stop", unit)
-	return err
-}
-
-func (s *Systemctl) Restart(ctx context.Context, unit string) error {
-	_, err := s.exec.Run(ctx, stopTimeout, "systemctl", "restart", unit)
 	return err
 }
 

@@ -53,6 +53,11 @@ type commit struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
+type urlRequest struct {
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+}
+
 type checkpointServer struct {
 	srv        *httptest.Server
 	mu         sync.Mutex
@@ -62,6 +67,7 @@ type checkpointServer struct {
 	hold       bool
 	entered    chan struct{}
 	urls       int
+	asked      []urlRequest
 	puts       []put
 	commits    []commit
 	saves      int
@@ -79,8 +85,11 @@ func newCheckpointServer(t *testing.T) *checkpointServer {
 func (s *checkpointServer) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/instances/i1/agent/state/checkpoint-url":
+		var asked urlRequest
+		_ = json.NewDecoder(r.Body).Decode(&asked)
 		s.mu.Lock()
 		s.urls++
+		s.asked = append(s.asked, asked)
 		s.tokens[r.Header.Get("x-provisioning-token")] = true
 		key := "u1/checkpoints/" + strconv.Itoa(s.urls)
 		code, upload := s.urlCode, s.uploadURL
@@ -148,6 +157,12 @@ func (s *checkpointServer) seen() (tokens map[string]bool, saves int) {
 		tokens[k] = v
 	}
 	return tokens, s.saves
+}
+
+func (s *checkpointServer) requests() []urlRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]urlRequest(nil), s.asked...)
 }
 
 func (s *checkpointServer) uploaded() ([]put, []commit) {
@@ -241,6 +256,9 @@ func TestCheckpointUploadsAndCommitsUserFolder(t *testing.T) {
 	if commits[0] != want || puts[0].key != want.Key || puts[0].length != want.SizeBytes {
 		t.Fatalf("commit %+v, want %+v, put key %s length %d", commits[0], want, puts[0].key, puts[0].length)
 	}
+	if asked := h.srv.requests(); len(asked) != 1 || asked[0] != (urlRequest{SizeBytes: want.SizeBytes, SHA256: want.SHA256}) {
+		t.Fatalf("upload url must be asked for the packed archive %d bytes %s, asked %+v", want.SizeBytes, want.SHA256, asked)
+	}
 	if tokens, _ := h.srv.seen(); !tokens["tok"] || len(tokens) != 1 {
 		t.Fatalf("backend calls must carry the provisioning token, got %v", tokens)
 	}
@@ -284,6 +302,26 @@ func TestCheckpointRefusedByBackendUploadsNothing(t *testing.T) {
 
 	h.srv.set(func(s *checkpointServer) { s.urlCode = 0 })
 	h.tick(t, every)
+	h.expect(t, 2, 1, 1)
+}
+
+func TestCheckpointRefusedByBackendWaitsForTheNextInterval(t *testing.T) {
+	var logs bytes.Buffer
+	h := newHarness(t)
+	h.m.log = slog.New(slog.NewTextHandler(&logs, nil))
+	h.srv.set(func(s *checkpointServer) { s.urlCode = http.StatusBadRequest })
+
+	h.tick(t, 0)
+	h.tick(t, every)
+	h.expect(t, 1, 0, 0)
+	h.tick(t, every-time.Second)
+	h.expect(t, 1, 0, 0)
+	if !strings.Contains(logs.String(), "400") {
+		t.Fatalf("refusal must be logged with its reason: %s", logs.String())
+	}
+
+	h.srv.set(func(s *checkpointServer) { s.urlCode = 0 })
+	h.tick(t, time.Second)
 	h.expect(t, 2, 1, 1)
 }
 

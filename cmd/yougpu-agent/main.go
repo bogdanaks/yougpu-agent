@@ -21,7 +21,6 @@ import (
 	"github.com/bogdanaks/yougpu-agent/internal/lifecycle"
 	"github.com/bogdanaks/yougpu-agent/internal/sshkeys"
 	"github.com/bogdanaks/yougpu-agent/internal/state"
-	"github.com/bogdanaks/yougpu-agent/internal/sts"
 	"github.com/bogdanaks/yougpu-agent/internal/system"
 	"github.com/bogdanaks/yougpu-agent/internal/tunnel"
 )
@@ -69,7 +68,7 @@ func main() {
 	httpClient := client.New(cfg.BackendURL, cfg.Token, version, logger)
 	executor := system.NewExecutor(logger)
 	systemd := system.NewSystemd(executor, logger)
-	diskMgr := disk.NewManager(systemd, executor, logger)
+	diskMgr := disk.NewManager(systemd, executor, httpClient, logger)
 	diskMgr.SetRcPortBase(cfg.RcloneRcPortBase)
 	if cfg.DiskDriver == config.DiskDriverDirect {
 		diskMgr.SetDirectMode(true)
@@ -83,7 +82,6 @@ func main() {
 	sshKeysMgr := sshkeys.NewManager(logger)
 	lifecycleMgr := lifecycle.NewManager(cfg.StateDir, systemd, executor, logger)
 	stateMgr := state.New(cfg.StateDir, httpClient, logger)
-	credsProvider := sts.NewProvider(httpClient, diskMgr, logger, cfg.CredsRefreshThreshold, cfg.CredsPeriodicInterval)
 
 	a := agent.New(agent.Config{
 		Version:           version,
@@ -100,7 +98,6 @@ func main() {
 		State:             stateMgr,
 		SSHKeys:           sshKeysMgr,
 		Lifecycle:         lifecycleMgr,
-		Creds:             credsProvider,
 		Logger:            logger,
 	})
 

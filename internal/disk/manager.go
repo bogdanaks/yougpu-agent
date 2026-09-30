@@ -30,7 +30,7 @@ import (
 const (
 	unitDir                 = "/etc/systemd/system"
 	unitPrefix              = "storage-mount-"
-	rcloneRemote            = "remote"
+	remotePrefix            = "disk-"
 	rcloneBin               = "/usr/bin/rclone"
 	defaultQuotaGB          = 5
 	minQuotaGB              = 2
@@ -44,9 +44,18 @@ const (
 	defaultFlushLimit       = 30 * time.Minute
 	unmountGap              = 5 * time.Minute
 	defaultSettle           = time.Second
+	keyRetryEvery           = 10 * time.Minute
 )
 
 var ErrFlushing = errors.New("disk cache is still uploading")
+
+var errStateUnknown = errors.New("unit state unknown")
+
+var driveIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
+type CredentialSource interface {
+	GetStorageCredentials(ctx context.Context, driveID string) (*client.StorageCredentials, error)
+}
 
 //go:embed unit.tmpl
 var unitTmpl string
@@ -87,7 +96,9 @@ type unmountWait struct {
 type Manager struct {
 	systemd          system.Systemd
 	exec             system.Executor
+	creds            CredentialSource
 	log              *slog.Logger
+	now              func() time.Time
 	unitsDir         string
 	rcloneConfigPath string
 	rcPortBase       int
@@ -99,13 +110,18 @@ type Manager struct {
 
 	mu         sync.Mutex
 	unmounting map[string]*unmountWait
+	keyAskedAt map[string]time.Time
+
+	confMu sync.Mutex
 }
 
-func NewManager(systemd system.Systemd, exec system.Executor, log *slog.Logger) *Manager {
+func NewManager(systemd system.Systemd, exec system.Executor, creds CredentialSource, log *slog.Logger) *Manager {
 	return &Manager{
 		systemd:          systemd,
 		exec:             exec,
+		creds:            creds,
 		log:              log,
+		now:              time.Now,
 		unitsDir:         unitDir,
 		rcloneConfigPath: defaultRcloneConfigPath,
 		rcPortBase:       defaultRcPortBase,
@@ -114,6 +130,7 @@ func NewManager(systemd system.Systemd, exec system.Executor, log *slog.Logger) 
 		flushLimit:       defaultFlushLimit,
 		settle:           defaultSettle,
 		unmounting:       map[string]*unmountWait{},
+		keyAskedAt:       map[string]time.Time{},
 	}
 }
 
@@ -133,7 +150,7 @@ func (m *Manager) SetDirectMarkersDir(dir string) { m.directMarkersDir = dir }
 
 func (m *Manager) mountArgs(spec client.AgentDiskSpec, quotaGB int) []string {
 	return []string{
-		"mount", fmt.Sprintf("%s:%s/%s", rcloneRemote, spec.Bucket, spec.S3Path), spec.MountPath,
+		"mount", fmt.Sprintf("%s:%s/%s", remoteName(spec.ID), spec.Bucket, spec.S3Path), spec.MountPath,
 		"--config", m.rcloneConfigPath,
 		"--vfs-cache-mode", "full",
 		"--vfs-cache-max-size", strconv.Itoa(quotaGB) + "G",
@@ -157,7 +174,21 @@ func (m *Manager) Mount(ctx context.Context, spec client.AgentDiskSpec) error {
 	if err := os.Chmod(spec.MountPath, 0o777); err != nil {
 		return fmt.Errorf("chmod mount path: %w", err)
 	}
+	if err := m.ensureRemote(ctx, spec.ID); err != nil {
+		return err
+	}
+	err := m.mount(ctx, spec)
+	if err == nil || ctx.Err() != nil || errors.Is(err, errStateUnknown) || !m.keyRetryDue(spec.ID) {
+		return err
+	}
+	m.log.Warn("mount failed, asking the backend for a new storage key", "id", spec.ID, "err", err)
+	if kerr := m.renewRemote(ctx, spec.ID); kerr != nil {
+		return fmt.Errorf("%w; %v", err, kerr)
+	}
+	return m.mount(ctx, spec)
+}
 
+func (m *Manager) mount(ctx context.Context, spec client.AgentDiskSpec) error {
 	args := m.mountArgs(spec, m.perDriveQuotaGB(ctx))
 	if m.direct {
 		return m.mountDirect(ctx, spec, args)
@@ -201,7 +232,7 @@ func (m *Manager) Mount(ctx context.Context, spec client.AgentDiskSpec) error {
 	time.Sleep(m.settle)
 	active, err := m.systemd.IsActive(ctx, unitName)
 	if err != nil {
-		return fmt.Errorf("is-active check: %w", err)
+		return fmt.Errorf("is-active check: %w: %w", errStateUnknown, err)
 	}
 	if !active {
 		return fmt.Errorf("unit %s did not become active", unitName)
@@ -240,7 +271,7 @@ func (m *Manager) Unmount(ctx context.Context, driveID string) error {
 
 	active, err := m.systemd.IsActive(ctx, unitName)
 	if err != nil {
-		m.log.Warn("is-active check failed during unmount", "unit", unitName, "err", err)
+		return fmt.Errorf("is-active %s: %w", unitName, err)
 	}
 	if active {
 		if m.flushing(ctx, driveID) {
@@ -257,6 +288,9 @@ func (m *Manager) Unmount(ctx context.Context, driveID string) error {
 		m.log.Debug("systemctl disable returned error", "unit", unitName, "err", err)
 	}
 
+	if err := m.dropRemote(driveID); err != nil {
+		return fmt.Errorf("remove storage key: %w", err)
+	}
 	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove unit file: %w", err)
 	}
@@ -306,6 +340,9 @@ func (m *Manager) unmountDirect(ctx context.Context, driveID string) error {
 	}
 	if _, err := m.exec.Run(ctx, 10*time.Second, "fusermount", "-uz", strings.TrimSpace(string(mountPath))); err != nil {
 		m.log.Warn("fusermount returned error (continuing)", "err", err)
+	}
+	if err := m.dropRemote(driveID); err != nil {
+		return fmt.Errorf("remove storage key: %w", err)
 	}
 	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove direct marker: %w", err)
@@ -385,84 +422,6 @@ func (m *Manager) EnsureRunning(ctx context.Context, driveID string) error {
 		return nil
 	}
 	return m.systemd.Start(ctx, unit)
-}
-
-func (m *Manager) ApplyCredentials(ctx context.Context, creds *client.StorageCredentials) error {
-	if creds == nil {
-		return fmt.Errorf("apply credentials: creds is nil")
-	}
-	if err := m.writeRcloneConfig(creds); err != nil {
-		return fmt.Errorf("write rclone config: %w", err)
-	}
-
-	ids, err := m.ListUnits()
-	if err != nil {
-		return fmt.Errorf("list units for reload: %w", err)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	if m.direct {
-		m.log.Info("ApplyCredentials: direct mode, rclone.conf written; mounts re-read on next op", "count", len(ids))
-		return nil
-	}
-
-	hotReloaded := 0
-	restarted := 0
-	for _, id := range ids {
-		if err := m.rcReload(ctx, id, creds); err != nil {
-			m.log.Warn("rc reload failed, falling back to restart", "id", id, "err", err)
-			if rerr := m.restartUnit(ctx, id); rerr != nil {
-				return fmt.Errorf("restart fallback for %s: %w", id, rerr)
-			}
-			restarted++
-		} else {
-			m.log.Debug("hot-reloaded creds via rc", "id", id)
-			hotReloaded++
-		}
-	}
-	m.log.Info("ApplyCredentials done", "hot_reloaded", hotReloaded, "restarted", restarted, "total", len(ids))
-	return nil
-}
-
-func (m *Manager) writeRcloneConfig(c *client.StorageCredentials) error {
-	dir := filepath.Dir(m.rcloneConfigPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	body := fmt.Sprintf(`[%s]
-type = s3
-provider = Other
-env_auth = false
-access_key_id = %s
-secret_access_key = %s
-endpoint = %s
-force_path_style = false
-acl = private
-`, rcloneRemote, c.AccessKey, c.SecretKey, c.Endpoint)
-
-	tmp := m.rcloneConfigPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body), configFileMode); err != nil {
-		return err
-	}
-	return os.Rename(tmp, m.rcloneConfigPath)
-}
-
-func (m *Manager) rcReload(ctx context.Context, driveID string, creds *client.StorageCredentials) error {
-	body := map[string]any{
-		"name": rcloneRemote,
-		"parameters": map[string]string{
-			"type":              "s3",
-			"provider":          "Other",
-			"env_auth":          "false",
-			"access_key_id":     creds.AccessKey,
-			"secret_access_key": creds.SecretKey,
-			"endpoint":          creds.Endpoint,
-			"force_path_style":  "false",
-			"acl":               "private",
-		},
-	}
-	return m.rc(ctx, driveID, "config/update", body, nil)
 }
 
 func (m *Manager) Uploads(ctx context.Context, driveID string) (Uploads, error) {
@@ -626,19 +585,6 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func (m *Manager) restartUnit(ctx context.Context, driveID string) error {
-	unit := unitNameFor(driveID)
-	if err := m.systemd.Restart(ctx, unit); err != nil {
-		return fmt.Errorf("restart %s: %w", unit, err)
-	}
-	time.Sleep(2 * m.settle)
-	active, err := m.systemd.IsActive(ctx, unit)
-	if err != nil || !active {
-		return fmt.Errorf("unit %s did not come back active after restart (err=%v)", unit, err)
-	}
-	return nil
 }
 
 func unitNameFor(driveID string) string { return unitPrefix + driveID + ".service" }

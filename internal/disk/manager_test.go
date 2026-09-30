@@ -3,6 +3,7 @@ package disk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -24,6 +25,8 @@ type fakeSystemd struct {
 	invocations map[string]string
 	calls       []string
 	startErr    error
+	activeErr   error
+	startCheck  func() error
 }
 
 func newFakeSystemd() *fakeSystemd {
@@ -67,6 +70,11 @@ func (f *fakeSystemd) Start(_ context.Context, u string) error {
 	if f.startErr != nil {
 		return f.startErr
 	}
+	if f.startCheck != nil {
+		if err := f.startCheck(); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	f.active[u] = true
 	f.mu.Unlock()
@@ -79,16 +87,12 @@ func (f *fakeSystemd) Stop(_ context.Context, u string) error {
 	f.mu.Unlock()
 	return nil
 }
-func (f *fakeSystemd) Restart(_ context.Context, u string) error {
-	f.record("restart:" + u)
-	f.mu.Lock()
-	f.active[u] = true
-	f.mu.Unlock()
-	return nil
-}
 func (f *fakeSystemd) IsActive(_ context.Context, u string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.activeErr != nil {
+		return false, f.activeErr
+	}
 	return f.active[u], nil
 }
 func (f *fakeSystemd) Poweroff(context.Context) error { f.record("poweroff"); return nil }
@@ -127,7 +131,7 @@ func newTestManagerExec(t *testing.T) (*Manager, *fakeSystemd, string, *fakeExec
 	sd := newFakeSystemd()
 	exec := &fakeExec{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	m := NewManager(sd, exec, log)
+	m := NewManager(sd, exec, &fakeKeys{}, log)
 	m.SetUnitsDir(tmp)
 	m.SetRcloneConfigPath(filepath.Join(t.TempDir(), "rclone.conf"))
 	m.SetDirectMarkersDir(filepath.Join(t.TempDir(), "mounts"))
@@ -193,7 +197,7 @@ func TestMountWritesUnitAndStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read unit: %v", err)
 	}
-	if !bytes.Contains(body, []byte("remote:test-bucket/u/abc/")) {
+	if !bytes.Contains(body, []byte("disk-abc:test-bucket/u/abc/")) {
 		t.Errorf("unit missing rclone path:\n%s", body)
 	}
 	if !bytes.Contains(body, []byte(spec.MountPath)) {
@@ -483,5 +487,28 @@ func TestListUnits(t *testing.T) {
 	}
 	if !set["a"] || !set["bbb"] {
 		t.Errorf("unexpected ids: %v", ids)
+	}
+}
+
+func TestUnmountKeepsRunningDiskWhenStateUnknown(t *testing.T) {
+	m, sd, tmp := newTestManager(t)
+	activeUnit(t, m, sd, tmp, "d1")
+	writeRcEnv(t, m, "d1", "127.0.0.1:1", "u", "p")
+	sd.activeErr = errors.New("systemctl is-active storage-mount-d1.service: signal: killed")
+
+	if err := m.Unmount(context.Background(), "d1"); err == nil {
+		t.Fatal("unmount must fail while the unit state is unknown")
+	}
+
+	for _, c := range []string{"stop:storage-mount-d1.service", "disable:storage-mount-d1.service"} {
+		if sd.called(c) {
+			t.Fatalf("%s called for a unit that may be running", c)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "storage-mount-d1.service")); err != nil {
+		t.Fatalf("unit file of a running rclone removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(m.rcloneConfigPath), "rc-d1.env")); err != nil {
+		t.Fatalf("rc env of a running rclone removed: %v", err)
 	}
 }

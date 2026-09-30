@@ -983,3 +983,37 @@ func TestRepoURLIsNeverAnOption(t *testing.T) {
 		t.Fatalf("url must follow --, git got %q", args)
 	}
 }
+
+func TestStopKillsGitWithItsHelpers(t *testing.T) {
+	bin := t.TempDir()
+	started := filepath.Join(t.TempDir(), "started")
+	script := "#!/bin/sh\n: > " + started + "\n/bin/sleep 30 &\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	mgr := newTestManager()
+	spec := &client.AgentContentSpec{Repos: []client.ContentRepo{{URL: "https://example.com/x.git", Dest: "custom_nodes/x"}}}
+	mgr.Reconcile(context.Background(), spec, containerWith(t.TempDir()))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("git not started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		mgr.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop waits for git helpers that outlived the cancel")
+	}
+}

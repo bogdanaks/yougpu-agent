@@ -118,3 +118,14 @@ func TestStateSpecIgnoresFreezeCommand(t *testing.T) {
 		t.Fatalf("freeze_command is gone from the contract, got %s", raw)
 	}
 }
+
+func TestUnresponsiveContainerIsMarked(t *testing.T) {
+	raw, _ := json.Marshal(AgentContainerObserved{ObservedState: ContainerRunning, SpecHash: "h", Unresponsive: true})
+	if !strings.Contains(string(raw), `"unresponsive":true`) {
+		t.Fatalf("got %s", raw)
+	}
+	raw, _ = json.Marshal(AgentContainerObserved{ObservedState: ContainerReady, SpecHash: "h"})
+	if strings.Contains(string(raw), "unresponsive") {
+		t.Fatalf("responsive container must not mention it, got %s", raw)
+	}
+}

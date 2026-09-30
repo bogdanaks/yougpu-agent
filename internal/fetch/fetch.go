@@ -51,7 +51,7 @@ func WorkspaceRoot(spec *client.AgentContainerSpec) string {
 }
 
 func Get(ctx context.Context, c *http.Client, rawURL, rng string, idle time.Duration) (*http.Response, error) {
-	reqCtx, watch := newIdleWatch(ctx, idle)
+	reqCtx, watch := newIdleWatch(ctx, idle, "no data for")
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		watch.stop()
@@ -60,6 +60,23 @@ func Get(ctx context.Context, c *http.Client, rawURL, rng string, idle time.Dura
 	if rng != "" {
 		req.Header.Set("Range", rng)
 	}
+	resp, err := c.Do(req)
+	if err != nil {
+		watch.stop()
+		return nil, Redact(watch.explain(err))
+	}
+	resp.Body = &idleBody{ReadCloser: resp.Body, watch: watch}
+	return resp, nil
+}
+
+func Put(ctx context.Context, c *http.Client, rawURL string, body io.Reader, size int64, idle time.Duration) (*http.Response, error) {
+	reqCtx, watch := newIdleWatch(ctx, idle, "nothing sent for")
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, rawURL, &idleUpload{Reader: body, watch: watch})
+	if err != nil {
+		watch.stop()
+		return nil, Redact(err)
+	}
+	req.ContentLength = size
 	resp, err := c.Do(req)
 	if err != nil {
 		watch.stop()
@@ -79,14 +96,15 @@ func Redact(err error) error {
 
 type idleWatch struct {
 	idle   time.Duration
+	stall  string
 	cancel context.CancelFunc
 	timer  *time.Timer
 	fired  atomic.Bool
 }
 
-func newIdleWatch(ctx context.Context, idle time.Duration) (context.Context, *idleWatch) {
+func newIdleWatch(ctx context.Context, idle time.Duration, stall string) (context.Context, *idleWatch) {
 	reqCtx, cancel := context.WithCancel(ctx)
-	w := &idleWatch{idle: idle, cancel: cancel}
+	w := &idleWatch{idle: idle, stall: stall, cancel: cancel}
 	w.timer = time.AfterFunc(idle, func() {
 		w.fired.Store(true)
 		cancel()
@@ -96,7 +114,7 @@ func newIdleWatch(ctx context.Context, idle time.Duration) (context.Context, *id
 
 func (w *idleWatch) explain(err error) error {
 	if err != nil && !errors.Is(err, io.EOF) && w.fired.Load() {
-		return fmt.Errorf("no data for %s", w.idle)
+		return fmt.Errorf("%s %s", w.stall, w.idle)
 	}
 	return err
 }
@@ -123,6 +141,19 @@ func (b *idleBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.watch.stop()
 	return err
+}
+
+type idleUpload struct {
+	io.Reader
+	watch *idleWatch
+}
+
+func (u *idleUpload) Read(p []byte) (int, error) {
+	n, err := u.Reader.Read(p)
+	if n > 0 {
+		u.watch.timer.Reset(u.watch.idle)
+	}
+	return n, err
 }
 
 type ctxReader struct {

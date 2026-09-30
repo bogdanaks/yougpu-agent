@@ -549,3 +549,47 @@ func TestSetupLogKeepsTailWithinBackendLimit(t *testing.T) {
 		t.Fatalf("tail with the error must be kept, got ...%s", (*obs.LastLog)[len(*obs.LastLog)-200:])
 	}
 }
+
+func TestReadyHostIsNeverReinstalled(t *testing.T) {
+	var calls []string
+	fe := &fakeExec{
+		calls:          &calls,
+		present:        map[string]bool{"gpg": true, "curl": true, "lspci": true, "nvidia-ctk": true, "fusermount3": true},
+		gpu:            true,
+		dockerUp:       true,
+		rcloneOK:       true,
+		fuseOK:         true,
+		aptConfPresent: true,
+		nvidiaRuntime:  []bool{true},
+	}
+	m := newManager(fe)
+	if obs := m.Reconcile(context.Background()); obs.ObservedState != client.SetupReady {
+		t.Fatalf("want ready, got %s", obs.ObservedState)
+	}
+	var emits []string
+	m.SetReporter(func(_ context.Context, obs client.AgentSetupObserved) { emits = append(emits, obs.ObservedState) })
+	fe.dockerUp = false
+	fe.nvidiaRuntime = []bool{false}
+	fe.rcloneOK = false
+	fe.fuseOK = false
+	fe.aptConfPresent = false
+	calls = nil
+
+	obs := m.Reconcile(context.Background())
+
+	if obs.ObservedState != client.SetupReady {
+		t.Fatalf("host that was ready must stay ready, got %s", obs.ObservedState)
+	}
+	for _, c := range calls {
+		if strings.Contains(c, "get.docker.com") || strings.Contains(c, "systemctl") || strings.Contains(c, "nvidia-ctk runtime configure") ||
+			strings.Contains(c, "apt-get") || strings.Contains(c, rcloneArchive) || strings.Contains(c, "printf") || strings.Contains(c, ">> /etc/fuse.conf") {
+			t.Fatalf("installer ran on a ready host: %s", c)
+		}
+	}
+	if !strings.Contains(joined(calls), "docker info") {
+		t.Fatalf("ready host must still be checked, calls: %s", joined(calls))
+	}
+	if len(emits) != 0 {
+		t.Fatalf("checks on a ready host must not report setup phases, got %v", emits)
+	}
+}

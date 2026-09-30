@@ -32,6 +32,7 @@ const (
 	maxError         = 1024
 	inspectNoExit    = "no such object"
 	inspectNotFound  = "No such object"
+	dockerSilent     = "docker не отвечает"
 )
 
 type Action int
@@ -55,6 +56,7 @@ type Manager struct {
 	log      *slog.Logger
 	name     string
 	stateDir string
+	last     *client.AgentContainerObserved
 }
 
 func NewManager(exec system.Executor, puller Puller, stateDir string, log *slog.Logger) *Manager {
@@ -116,13 +118,27 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec
 
 	obs, err := m.observe(ctx)
 	if err != nil {
-		if hasSpec {
-			m.log.Warn("container inspect failed", "err", err)
-		} else {
+		if !hasSpec {
 			m.log.Debug("container inspect skipped", "err", err)
+			return client.AgentContainerObserved{ObservedState: client.ContainerAbsent}
 		}
+		m.log.Warn("container inspect failed, keeping the last observation until the next tick", "err", err)
+		return m.unknown(desiredHash)
 	}
+	result := m.converge(ctx, spec, hasSpec, desiredHash, obs, beforeStart)
+	m.last = &result
+	return result
+}
 
+func (m *Manager) unknown(desiredHash string) client.AgentContainerObserved {
+	if m.last != nil {
+		return *m.last
+	}
+	detail := dockerSilent
+	return client.AgentContainerObserved{ObservedState: client.ContainerStarting, SpecHash: desiredHash, Detail: &detail}
+}
+
+func (m *Manager) converge(ctx context.Context, spec *client.AgentContainerSpec, hasSpec bool, desiredHash string, obs Observed, beforeStart func() bool) client.AgentContainerObserved {
 	switch Decide(hasSpec, desiredHash, obs) {
 	case ActionNone:
 		if hasSpec && obs.Running {
@@ -146,7 +162,11 @@ func (m *Manager) Reconcile(ctx context.Context, spec *client.AgentContainerSpec
 			m.log.Error("container apply failed", "err", err)
 			return m.errorReport(desiredHash, err)
 		}
-		obs, _ = m.observe(ctx)
+		obs, err := m.observe(ctx)
+		if err != nil {
+			m.log.Warn("container inspect after run failed", "err", err)
+			return client.AgentContainerObserved{ObservedState: client.ContainerRunning, SpecHash: desiredHash}
+		}
 		return m.report(hasSpec, desiredHash, obs, nil)
 	}
 	return m.report(hasSpec, desiredHash, obs, nil)
@@ -176,9 +196,9 @@ func (m *Manager) observe(ctx context.Context) (Observed, error) {
 		"--format", "{{.State.Running}}|{{index .Config.Labels \""+labelSpecHash+"\"}}")
 	if err != nil {
 		if isNotFound(err) {
-			return Observed{Exists: false}, nil
+			return Observed{}, nil
 		}
-		return Observed{Exists: false}, err
+		return Observed{}, err
 	}
 	parts := strings.SplitN(strings.TrimSpace(out), "|", 2)
 	obs := Observed{Exists: true}

@@ -1,0 +1,32 @@
+# Тестовый образ агента для E2E через testcontainers.
+# Не для прода: использует root, без systemd, агент запускается как PID 1.
+# rclone + fuse3 нужны для real-flush в C-сценариях; ca-certificates — для HTTPS-вызовов
+# к backend'у (хотя в тестах он HTTP).
+FROM ubuntu:24.04
+
+ARG RCLONE_VERSION=v1.75.1
+ARG RCLONE_SHA256=982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        fuse3 \
+        unzip \
+        util-linux \
+    && curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip" \
+    && echo "${RCLONE_SHA256}  /tmp/rclone.zip" | sha256sum -c - \
+    && unzip -q /tmp/rclone.zip -d /tmp \
+    && install -m 0755 "/tmp/rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/bin/rclone \
+    && rm -rf /tmp/rclone.zip "/tmp/rclone-${RCLONE_VERSION}-linux-amd64" /var/lib/apt/lists/* \
+    && echo "user_allow_other" >> /etc/fuse.conf
+
+# Бинарь собирается на хосте через `make build-linux` (CGO_ENABLED=0), потом копируется
+# в образ — Go-toolchain в образе не нужен, build остаётся быстрым.
+COPY bin/yougpu-agent-linux-amd64 /usr/local/bin/yougpu-agent
+RUN chmod +x /usr/local/bin/yougpu-agent
+
+ENV AGENT_TOKEN_FILE=/var/lib/agent/token \
+    AGENT_STATE_DIR=/var/lib/agent
+
+ENTRYPOINT ["/usr/local/bin/yougpu-agent"]

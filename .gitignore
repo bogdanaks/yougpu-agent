@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 *.test
+!Dockerfile.test
 *.out
 coverage.*
 
@@ -17,3 +18,4 @@ coverage.*
 *.swo
 *~
 *.md
+!RELEASING.md

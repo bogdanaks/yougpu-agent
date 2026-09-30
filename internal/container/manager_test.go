@@ -360,3 +360,67 @@ func TestRestartKeepsTheSameContainer(t *testing.T) {
 		t.Fatalf("want a single docker restart of app_container, got %v", calls)
 	}
 }
+
+type flakyExec struct {
+	inspect string
+	inspErr error
+	calls   []string
+}
+
+func (f *flakyExec) Run(_ context.Context, _ time.Duration, name string, args ...string) (string, error) {
+	if name == "docker" && len(args) > 0 && args[0] == "inspect" {
+		return f.inspect, f.inspErr
+	}
+	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
+	return "", nil
+}
+
+func TestInspectFailureKeepsLastObservation(t *testing.T) {
+	spec := sampleSpec()
+	spec.Volumes = nil
+	hash := SpecHash(spec)
+	ex := &flakyExec{inspect: "true|" + hash}
+	puller := &fakePuller{}
+	m := NewManager(ex, puller, "", testLogger())
+
+	if obs := m.Reconcile(context.Background(), spec, nil); obs.ObservedState != client.ContainerRunning {
+		t.Fatalf("want running, got %+v", obs)
+	}
+	ex.inspect, ex.inspErr = "", fmt.Errorf("docker inspect app_container: signal: killed (stderr: )")
+
+	obs := m.Reconcile(context.Background(), spec, func() bool { return true })
+
+	if len(puller.pulled) != 0 || len(ex.calls) != 0 {
+		t.Fatalf("spec applied although docker did not answer: pulled %v, calls %v", puller.pulled, ex.calls)
+	}
+	if obs.ObservedState != client.ContainerRunning || obs.SpecHash != hash || obs.LastError != nil {
+		t.Fatalf("last observation must be repeated, got %+v", obs)
+	}
+
+	ex.inspect, ex.inspErr = "true|"+hash, nil
+	if obs := m.Reconcile(context.Background(), spec, nil); obs.ObservedState != client.ContainerRunning || len(ex.calls) != 0 {
+		t.Fatalf("next tick must observe again, got %+v calls %v", obs, ex.calls)
+	}
+}
+
+func TestInspectFailureWithoutHistoryIsNotAnError(t *testing.T) {
+	spec := sampleSpec()
+	spec.Volumes = nil
+	ex := &flakyExec{inspErr: fmt.Errorf("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")}
+	puller := &fakePuller{}
+	m := NewManager(ex, puller, "", testLogger())
+
+	obs := m.Reconcile(context.Background(), spec, func() bool { return true })
+
+	if len(puller.pulled) != 0 || len(ex.calls) != 0 {
+		t.Fatalf("spec applied although docker did not answer: pulled %v, calls %v", puller.pulled, ex.calls)
+	}
+	if obs.ObservedState == client.ContainerError || obs.ObservedState == client.ContainerAbsent || obs.LastError != nil {
+		t.Fatalf("unknown container must not look failed or gone, got %+v", obs)
+	}
+
+	m.Reconcile(context.Background(), nil, nil)
+	if len(ex.calls) != 0 {
+		t.Fatalf("container removed although docker did not answer: %v", ex.calls)
+	}
+}

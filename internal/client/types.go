@@ -1,7 +1,5 @@
 package client
 
-import "time"
-
 type AgentSpec struct {
 	Generation int64               `json:"generation"`
 	Lifecycle  SpecLifecycle       `json:"lifecycle"`
@@ -43,6 +41,11 @@ type StateCheckpoint struct {
 	Include  []string `json:"include"`
 	EverySec int64    `json:"every_sec"`
 	MaxBytes int64    `json:"max_bytes"`
+}
+
+type CheckpointRequest struct {
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
 }
 
 type CheckpointUpload struct {
@@ -172,6 +175,7 @@ type AgentContainerObserved struct {
 	Detail        *string `json:"detail,omitempty"`
 	SpecHash      string  `json:"spec_hash,omitempty"`
 	LastError     *string `json:"last_error"`
+	Unresponsive  bool    `json:"unresponsive,omitempty"`
 }
 
 type AgentFirewallObserved struct {
@@ -245,10 +249,13 @@ const (
 	ContentError       = "error"
 )
 
+type StorageCredentialsRequest struct {
+	DriveID string `json:"drive_id"`
+}
+
 type StorageCredentials struct {
-	Endpoint     string    `json:"endpoint"`
-	AccessKey    string    `json:"accessKey"`
-	SecretKey    string    `json:"secretKey"`
-	ExpiresAt    time.Time `json:"expiresAt"`
-	CredentialID string    `json:"credentialId"`
+	Endpoint     string `json:"endpoint"`
+	AccessKey    string `json:"accessKey"`
+	SecretKey    string `json:"secretKey"`
+	CredentialID string `json:"credentialId"`
 }

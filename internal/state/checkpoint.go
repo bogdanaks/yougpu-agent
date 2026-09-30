@@ -90,9 +90,13 @@ func (m *Manager) checkpointOnce(ctx context.Context, spec client.StateCheckpoin
 		m.log.Debug("workspace checkpoint unchanged")
 		return nil
 	}
-	target, err := m.backend.CheckpointURL(ctx)
+	target, err := m.backend.CheckpointURL(ctx, client.CheckpointRequest{SizeBytes: size, SHA256: sum})
 	if client.IsConflict(err) {
 		m.log.Info("backend takes no workspace checkpoint now")
+		return nil
+	}
+	if client.IsBadRequest(err) {
+		m.log.Warn("backend refused the workspace checkpoint, will try on the next interval", "bytes", size, "err", fetch.Clip(err.Error(), maxError))
 		return nil
 	}
 	if err != nil {

@@ -1,7 +1,10 @@
 package fetch
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -130,5 +133,85 @@ func TestRedirectFromHTTPSToHTTPIsRefused(t *testing.T) {
 	}
 	if plainHits.Load() != 0 {
 		t.Fatal("request reached the http target")
+	}
+}
+
+type stingyListener struct{ net.Listener }
+
+func (l stingyListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		_ = c.(*net.TCPConn).SetReadBuffer(4096)
+	}
+	return c, err
+}
+
+func stingyClient() *http.Client {
+	c := NewHTTPClient()
+	c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err == nil {
+			_ = conn.(*net.TCPConn).SetWriteBuffer(4096)
+		}
+		return conn, err
+	}
+	return c
+}
+
+func stalledServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	srv.Listener = stingyListener{srv.Listener}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv
+}
+
+func TestPutGivesUpWhenNothingIsSent(t *testing.T) {
+	srv := stalledServer(t)
+	body := make([]byte, 8<<20)
+
+	start := time.Now()
+	resp, err := Put(context.Background(), stingyClient(), srv.URL+"/b2?X-Amz-Signature=SECRET", bytes.NewReader(body), int64(len(body)), 100*time.Millisecond)
+
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("stalled upload must fail")
+	}
+	if !strings.Contains(err.Error(), "nothing sent for 100ms") || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("err = %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("stalled upload took %s to give up", took)
+	}
+}
+
+func TestPutSendsTheWholeBodyWithItsLength(t *testing.T) {
+	var got atomic.Int64
+	var length atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		length.Store(r.ContentLength)
+		n, _ := io.Copy(io.Discard, r.Body)
+		got.Store(n)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	body := make([]byte, 1<<20)
+
+	resp, err := Put(context.Background(), NewHTTPClient(), srv.URL, bytes.NewReader(body), int64(len(body)), 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK || got.Load() != int64(len(body)) || length.Load() != int64(len(body)) {
+		t.Fatalf("status %d, sent %d with length %d, want %d", resp.StatusCode, got.Load(), length.Load(), len(body))
 	}
 }

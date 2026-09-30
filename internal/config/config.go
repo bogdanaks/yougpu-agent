@@ -9,39 +9,33 @@ import (
 )
 
 type Config struct {
-	BackendURL            string
-	Token                 string
-	StateDir              string
-	HeartbeatInterval     time.Duration
-	CredsRefreshThreshold time.Duration
-	CredsPeriodicInterval time.Duration
-	ReconcileInterval     time.Duration
-	RcloneRcPortBase      int
-	DiskDriver            string
-	LogLevel              string
+	BackendURL        string
+	Token             string
+	StateDir          string
+	HeartbeatInterval time.Duration
+	ReconcileInterval time.Duration
+	RcloneRcPortBase  int
+	DiskDriver        string
+	LogLevel          string
 }
 
 const (
-	envBackendURL            = "AGENT_BACKEND_URL"
-	envTokenFile             = "AGENT_TOKEN_FILE"
-	envStateDir              = "AGENT_STATE_DIR"
-	envHeartbeatInterval     = "AGENT_HEARTBEAT_INTERVAL"
-	envCredsRefreshThreshold = "AGENT_CREDS_REFRESH_THRESHOLD"
-	envCredsPeriodicInterval = "AGENT_CREDS_PERIODIC_INTERVAL"
-	envReconcileInterval     = "AGENT_RECONCILE_INTERVAL"
-	envRcloneRcPortBase      = "AGENT_RCLONE_RC_PORT_BASE"
-	envDiskDriver            = "AGENT_DISK_DRIVER"
-	envLogLevel              = "AGENT_LOG_LEVEL"
-	defaultTokenFile         = "/var/lib/agent/token"
-	defaultStateDir          = "/var/lib/agent"
-	defaultHeartbeat         = 30 * time.Second
-	defaultCredsRefreshThr   = 3 * time.Hour
-	defaultCredsPeriodic     = 1 * time.Hour
-	defaultReconcile         = 60 * time.Second
-	defaultRcloneRcPortBase  = 5572
-	defaultLogLevel          = "info"
-	DiskDriverSystemd        = "systemd"
-	DiskDriverDirect         = "direct"
+	envBackendURL           = "AGENT_BACKEND_URL"
+	envTokenFile            = "AGENT_TOKEN_FILE"
+	envStateDir             = "AGENT_STATE_DIR"
+	envHeartbeatInterval    = "AGENT_HEARTBEAT_INTERVAL"
+	envReconcileInterval    = "AGENT_RECONCILE_INTERVAL"
+	envRcloneRcPortBase     = "AGENT_RCLONE_RC_PORT_BASE"
+	envDiskDriver           = "AGENT_DISK_DRIVER"
+	envLogLevel             = "AGENT_LOG_LEVEL"
+	defaultTokenFile        = "/var/lib/agent/token"
+	defaultStateDir         = "/var/lib/agent"
+	defaultHeartbeat        = 30 * time.Second
+	defaultReconcile        = 60 * time.Second
+	defaultRcloneRcPortBase = 5572
+	defaultLogLevel         = "info"
+	DiskDriverSystemd       = "systemd"
+	DiskDriverDirect        = "direct"
 )
 
 func Load() (*Config, error) {
@@ -68,14 +62,6 @@ func Load() (*Config, error) {
 	}
 
 	heartbeat, err := durationEnv(envHeartbeatInterval, defaultHeartbeat)
-	if err != nil {
-		return nil, err
-	}
-	credsRefreshThr, err := durationEnv(envCredsRefreshThreshold, defaultCredsRefreshThr)
-	if err != nil {
-		return nil, err
-	}
-	credsPeriodic, err := durationEnv(envCredsPeriodicInterval, defaultCredsPeriodic)
 	if err != nil {
 		return nil, err
 	}
@@ -108,16 +94,14 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		BackendURL:            backendURL,
-		Token:                 token,
-		StateDir:              stateDir,
-		HeartbeatInterval:     heartbeat,
-		CredsRefreshThreshold: credsRefreshThr,
-		CredsPeriodicInterval: credsPeriodic,
-		ReconcileInterval:     reconcile,
-		RcloneRcPortBase:      rcPortBase,
-		DiskDriver:            diskDriver,
-		LogLevel:              logLevel,
+		BackendURL:        backendURL,
+		Token:             token,
+		StateDir:          stateDir,
+		HeartbeatInterval: heartbeat,
+		ReconcileInterval: reconcile,
+		RcloneRcPortBase:  rcPortBase,
+		DiskDriver:        diskDriver,
+		LogLevel:          logLevel,
 	}, nil
 }
 

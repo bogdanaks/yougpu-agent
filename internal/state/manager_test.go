@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -451,6 +452,35 @@ func TestOverlayReplacesUserOfFullArchive(t *testing.T) {
 	}
 	if exists(root, restoreDir) || exists(m.stateDir, inArchive) || exists(m.stateDir, overlayArchive) {
 		t.Fatal("temporary files left behind")
+	}
+}
+
+func TestOverlayReplacesOnlyFoldersItCarries(t *testing.T) {
+	full, fullSum := archiveOf(t, map[string]string{
+		"custom_nodes/pack/__init__.py": "nodes",
+		"user/default/tabs.json":        "full",
+	})
+	overlay, overlaySum := archiveOf(t, map[string]string{"user/default/tabs.json": "checkpoint"})
+	srv, _ := serveArchives(t, map[string][]byte{"/full": full, "/overlay": overlay})
+	m, _ := newManager(t)
+	root := t.TempDir()
+	spec := restoreSpec(srv.URL+"/full", fullSum, len(full))
+	spec.Overlay = overlaySpec(srv.URL+"/overlay", overlaySum, len(overlay))
+	spec.Overlay.Include = []string{"user", "custom_nodes"}
+
+	ok, obs := restoreWithin(t, m, spec, root)
+
+	if !ok || obs.ObservedState != client.StateRestored {
+		t.Fatalf("ok=%v obs=%+v", ok, obs)
+	}
+	if !exists(root, "custom_nodes/pack/__init__.py") || readFile(t, root, "custom_nodes/pack/__init__.py") != "nodes" {
+		t.Fatal("folder the overlay does not carry was dropped from the full archive")
+	}
+	if readFile(t, root, "user/default/tabs.json") != "checkpoint" {
+		t.Fatal("overlay not applied")
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 2 {
+		t.Fatalf("temporary folders left behind: %v", entries)
 	}
 }
 
@@ -967,5 +997,69 @@ func TestRetryDelayFollowsContext(t *testing.T) {
 	}
 	if rec.count(client.StateRestoreFailed) != 0 {
 		t.Fatalf("cancelled restore reported as failed: %v", rec.states())
+	}
+}
+
+func TestSaveAttemptIsShorterThanItsWindow(t *testing.T) {
+	m := New(t.TempDir(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if m.saveTimeout != 10*time.Minute || m.saveWindow != 30*time.Minute {
+		t.Fatalf("attempt %s within window %s, want 10m within 30m", m.saveTimeout, m.saveWindow)
+	}
+}
+
+type stingyListener struct{ net.Listener }
+
+func (l stingyListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		_ = c.(*net.TCPConn).SetReadBuffer(4096)
+	}
+	return c, err
+}
+
+func stingyClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err == nil {
+			_ = conn.(*net.TCPConn).SetWriteBuffer(4096)
+		}
+		return conn, err
+	}
+	return &http.Client{Transport: tr}
+}
+
+func TestSaveAttemptGivesUpWhenUploadStalls(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	srv.Listener = stingyListener{srv.Listener}
+	srv.Start()
+	defer srv.Close()
+	defer close(release)
+	m, _ := newManager(t)
+	m.http = stingyClient()
+	m.idle = 100 * time.Millisecond
+	m.retryDelay = time.Hour
+	ranHere(t, m)
+	root := t.TempDir()
+	writeFile(t, root, "user/default/big.bin", string(randomBytes(8<<20)), 0o644)
+	spec := &client.AgentStateSpec{Include: testInclude, Save: &client.StateSave{UploadURL: srv.URL + "/save"}}
+
+	done := make(chan *client.AgentStateObserved, 1)
+	go func() { done <- m.Save(context.Background(), spec, workspace(root), nil) }()
+	var obs *client.AgentStateObserved
+	select {
+	case obs = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stalled upload holds the save attempt")
+	}
+
+	if obs.ObservedState != client.StateSaving || obs.LastError == nil || !strings.Contains(*obs.LastError, "nothing sent for 100ms") {
+		t.Fatalf("stalled attempt must be retried later, got %+v", obs)
 	}
 }

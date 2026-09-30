@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -30,6 +31,7 @@ const (
 	failedMarker      = "state_save_failed"
 	saveStartMarker   = "state_save_started"
 	restoreDir        = ".yougpu-restore"
+	overlayDir        = ".yougpu-overlay"
 	maxUnpacked       = 20 << 30
 	maxEntries        = 500_000
 	packedMarker      = "state_packed"
@@ -41,7 +43,7 @@ const (
 	maxUpload         = 5_000_000_000
 	maxError          = 1024
 	restoreTimeout    = 30 * time.Minute
-	saveTimeout       = 30 * time.Minute
+	saveTimeout       = 10 * time.Minute
 	checkpointTimeout = 15 * time.Minute
 	saveWindow        = 30 * time.Minute
 	maxRetryDelay     = 2 * time.Minute
@@ -51,7 +53,7 @@ const (
 )
 
 type Backend interface {
-	CheckpointURL(ctx context.Context) (*client.CheckpointUpload, error)
+	CheckpointURL(ctx context.Context, archive client.CheckpointRequest) (*client.CheckpointUpload, error)
 	CommitCheckpoint(ctx context.Context, commit client.CheckpointCommit) error
 }
 
@@ -296,20 +298,46 @@ func (m *Manager) restore(ctx context.Context, spec *client.AgentStateSpec, root
 		}
 	}
 	if spec.Overlay != nil {
-		for _, dir := range spec.Overlay.Include {
-			rel, err := safeRel(dir)
-			if err != nil {
-				return fmt.Errorf("overlay: %w", err)
-			}
-			if err := os.RemoveAll(filepath.Join(tmp, filepath.FromSlash(rel))); err != nil {
-				return err
-			}
-		}
-		if err := m.unpackFile(ctx, overlay, tmp, spec.Overlay.Include); err != nil {
+		if err := m.layOverlay(ctx, overlay, root, tmp, spec.Overlay.Include); err != nil {
 			return fmt.Errorf("overlay: %w", err)
 		}
 	}
 	return moveInto(tmp, root)
+}
+
+func (m *Manager) layOverlay(ctx context.Context, archive, root, dest string, include []string) error {
+	rels := make([]string, 0, len(include))
+	for _, dir := range include {
+		rel, err := safeRel(dir)
+		if err != nil {
+			return err
+		}
+		rels = append(rels, filepath.FromSlash(rel))
+	}
+	tmp := filepath.Join(root, overlayDir)
+	if err := os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	if err := m.unpackFile(ctx, archive, tmp, include); err != nil {
+		return err
+	}
+	for _, rel := range rels {
+		_, err := os.Lstat(filepath.Join(tmp, rel))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(filepath.Join(dest, rel)); err != nil {
+			return err
+		}
+	}
+	return moveInto(tmp, dest)
 }
 
 func (m *Manager) fetchVerified(ctx context.Context, spec *client.StateRestore, dest string) error {
@@ -664,14 +692,9 @@ func (m *Manager) upload(ctx context.Context, rawURL, file string, size int64) e
 		return err
 	}
 	defer f.Close()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, f)
+	resp, err := fetch.Put(ctx, m.http, rawURL, f, size, m.idle)
 	if err != nil {
-		return fetch.Redact(err)
-	}
-	req.ContentLength = size
-	resp, err := m.http.Do(req)
-	if err != nil {
-		return fetch.Redact(err)
+		return fmt.Errorf("state upload: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {

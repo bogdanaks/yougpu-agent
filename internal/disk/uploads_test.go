@@ -2,7 +2,6 @@ package disk
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -13,8 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/bogdanaks/yougpu-agent/internal/client"
 )
 
 func writeRcEnv(t *testing.T, m *Manager, id, addr, user, pass string) {
@@ -142,37 +139,6 @@ func TestUploadsErrorOnBadAnswer(t *testing.T) {
 	})
 	if _, err := m.Uploads(context.Background(), "d1"); err == nil {
 		t.Fatal("want error on rc failure")
-	}
-}
-
-func TestCredentialsHotReloadUsesRcPassword(t *testing.T) {
-	m, sd, tmp := newTestManager(t)
-	if err := os.WriteFile(filepath.Join(tmp, "storage-mount-d1.service"), []byte("unit"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var got atomic.Value
-	withRc(t, m, "d1", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/config/update" {
-			http.NotFound(w, r)
-			return
-		}
-		var body struct {
-			Parameters map[string]string `json:"parameters"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		got.Store(body.Parameters["access_key_id"])
-	})
-
-	err := m.ApplyCredentials(context.Background(), &client.StorageCredentials{AccessKey: "AK2", SecretKey: "SK2", Endpoint: "https://s3", ExpiresAt: time.Now().Add(time.Hour)})
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Load() != "AK2" {
-		t.Fatalf("hot reload did not reach rc, got %v", got.Load())
-	}
-	if sd.called("restart:storage-mount-d1.service") {
-		t.Fatal("unit restarted although rc accepted the new key")
 	}
 }
 

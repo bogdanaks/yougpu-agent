@@ -14,7 +14,6 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -28,6 +27,7 @@ import (
 
 	"github.com/bogdanaks/yougpu-agent/internal/client"
 	"github.com/bogdanaks/yougpu-agent/internal/fetch"
+	"github.com/bogdanaks/yougpu-agent/internal/system"
 )
 
 const (
@@ -713,7 +713,7 @@ func (m *Manager) clone(ctx context.Context, t task) error {
 		args = append(args, "--branch", t.repo.Ref)
 	}
 	args = append(args, "--", t.repo.URL, t.target)
-	if out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput(); err != nil {
+	if out, err := system.Command(ctx, "git", args...).CombinedOutput(); err != nil {
 		os.RemoveAll(t.target)
 		return fmt.Errorf("git clone: %w: %s", err, fetch.Clip(strings.TrimSpace(string(out)), maxItemError))
 	}

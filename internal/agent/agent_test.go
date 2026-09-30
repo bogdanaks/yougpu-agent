@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -418,12 +420,6 @@ func (f *fakeContent) stops() int {
 	return f.stopped
 }
 
-type fakeCreds struct{}
-
-func (fakeCreds) EnsureFresh(context.Context) error  { return nil }
-func (fakeCreds) ForceRefresh(context.Context) error { return nil }
-func (fakeCreds) Run(context.Context)                {}
-
 func newTestAgent(rec *recorder, setup client.AgentSetupObserved) (*Agent, *fakeClient, *fakeDisk, *fakeContainer, *fakeFirewall, *fakeHostSetup) {
 	cl := &fakeClient{}
 	disk := &fakeDisk{rec: rec}
@@ -437,7 +433,6 @@ func newTestAgent(rec *recorder, setup client.AgentSetupObserved) (*Agent, *fake
 		Firewall:  fw,
 		HostSetup: hs,
 		Lifecycle: &fakeLifecycle{},
-		Creds:     fakeCreds{},
 		Logger:    testLogger(),
 	})
 	return a, cl, disk, cont, fw, hs
@@ -569,7 +564,6 @@ func contentAgent(rec *recorder, content *fakeContent, cont ContainerReconciler)
 		HostSetup: &fakeHostSetup{rec: rec, obs: client.AgentSetupObserved{ObservedState: client.SetupReady}},
 		Content:   content,
 		Lifecycle: &fakeLifecycle{},
-		Creds:     fakeCreds{},
 		Logger:    testLogger(),
 	})
 	return a, cl
@@ -701,7 +695,6 @@ func stateAgent(rec *recorder, st *fakeState) (*Agent, *fakeClient) {
 		HostSetup: &fakeHostSetup{rec: rec, obs: client.AgentSetupObserved{ObservedState: client.SetupReady}},
 		State:     st,
 		Lifecycle: &fakeLifecycle{},
-		Creds:     fakeCreds{},
 		Logger:    testLogger(),
 	})
 	return a, cl
@@ -938,7 +931,6 @@ func startRun(t *testing.T, rec *recorder, cont ContainerReconciler) *runHarness
 		Content:           content,
 		State:             st,
 		Lifecycle:         life,
-		Creds:             fakeCreds{},
 		Logger:            testLogger(),
 		ReconcileInterval: time.Hour,
 		HeartbeatInterval: time.Hour,
@@ -1286,5 +1278,252 @@ func TestLifecycleErrorReasonIsReported(t *testing.T) {
 	last := cl.last()
 	if last.Lifecycle.ObservedState != lifecycle.StateError || last.Lifecycle.LastError == nil || *last.Lifecycle.LastError != reason {
 		t.Fatalf("lifecycle error must carry its reason, got %+v", last.Lifecycle)
+	}
+}
+
+type cancellingDisk struct {
+	fakeDisk
+	cancel context.CancelFunc
+	mounts []string
+}
+
+func (c *cancellingDisk) Mount(_ context.Context, spec client.AgentDiskSpec) error {
+	c.mu.Lock()
+	c.mounts = append(c.mounts, spec.ID)
+	c.mu.Unlock()
+	c.cancel()
+	return errors.New("interrupted")
+}
+
+func TestReconcileDisksStopsWhenCancelled(t *testing.T) {
+	rec := &recorder{}
+	a, _, _, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dk := &cancellingDisk{fakeDisk: fakeDisk{rec: rec}, cancel: cancel}
+	a.cfg.Disk = dk
+	spec := specWithWork()
+	spec.Disks = []client.AgentDiskSpec{diskSpec("d1"), diskSpec("d2"), diskSpec("d3")}
+
+	a.reconcileDisks(ctx, spec)
+
+	if len(dk.mounts) != 1 {
+		t.Fatalf("disk actions must stop once the pass is cancelled, mounted %v", dk.mounts)
+	}
+}
+
+type hashedContainer struct {
+	mu   sync.Mutex
+	hash string
+}
+
+func (h *hashedContainer) Reconcile(context.Context, *client.AgentContainerSpec, func() bool) client.AgentContainerObserved {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return client.AgentContainerObserved{ObservedState: client.ContainerRunning, SpecHash: h.hash}
+}
+func (h *hashedContainer) SetReporter(func(context.Context, client.AgentContainerObserved)) {}
+func (h *hashedContainer) Restart(context.Context) error                                    { return nil }
+
+func (h *hashedContainer) set(hash string) {
+	h.mu.Lock()
+	h.hash = hash
+	h.mu.Unlock()
+}
+
+type appPort struct {
+	t    *testing.T
+	port int
+	l    net.Listener
+}
+
+func newAppPort(t *testing.T) *appPort {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &appPort{t: t, port: l.Addr().(*net.TCPAddr).Port}
+	_ = l.Close()
+	t.Cleanup(p.close)
+	return p
+}
+
+func (p *appPort) open() {
+	p.t.Helper()
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port)))
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	p.l = l
+}
+
+func (p *appPort) close() {
+	if p.l != nil {
+		_ = p.l.Close()
+		p.l = nil
+	}
+}
+
+func readinessAgent(t *testing.T, port int) (*Agent, *fakeClient, *hashedContainer, *fakeDisk, *client.AgentSpec) {
+	t.Helper()
+	rec := &recorder{}
+	a, cl, dk, _, _, _ := newTestAgent(rec, client.AgentSetupObserved{ObservedState: client.SetupReady})
+	cont := &hashedContainer{hash: "h1"}
+	a.cfg.Container = cont
+	a.cfg.Tunnel = &fakeTunnel{ok: true}
+	a.readyTimeout = 100 * time.Millisecond
+	a.readyProbe = 10 * time.Millisecond
+	spec := specWithWork()
+	spec.Tunnel = &client.AgentTunnelSpec{Slug: "s", FrpsAddr: "gw:7000", Proxies: []client.TunnelProxy{{Subdomain: "s-comfyui", LocalPort: port}}}
+	a.lastSpec.Store(spec)
+	return a, cl, cont, dk, spec
+}
+
+func pass(t *testing.T, a *Agent, cl *fakeClient, spec *client.AgentSpec, within time.Duration) *client.AgentContainerObserved {
+	t.Helper()
+	start := time.Now()
+	if err := a.handleSpec(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > within {
+		t.Fatalf("pass took %s, want within %s", took, within)
+	}
+	return cl.last().Container
+}
+
+func TestContainerThatNeverListensIsUnresponsive(t *testing.T) {
+	port := newAppPort(t)
+	a, cl, _, _, spec := readinessAgent(t, port.port)
+
+	got := pass(t, a, cl, spec, 5*time.Second)
+	if got.ObservedState != client.ContainerRunning || !got.Unresponsive {
+		t.Fatalf("container without open ports after the wait must be running and unresponsive, got %+v", got)
+	}
+
+	a.readyTimeout = time.Hour
+	got = pass(t, a, cl, spec, 5*time.Second)
+	if got.ObservedState != client.ContainerRunning || !got.Unresponsive {
+		t.Fatalf("next tick must check once and stay unresponsive, got %+v", got)
+	}
+
+	port.open()
+	got = pass(t, a, cl, spec, 5*time.Second)
+	if got.ObservedState != client.ContainerReady || got.Unresponsive {
+		t.Fatalf("opened ports must make the container ready, got %+v", got)
+	}
+}
+
+func TestReadinessNeedsTheTunnelToo(t *testing.T) {
+	port := newAppPort(t)
+	port.open()
+	a, cl, _, _, spec := readinessAgent(t, port.port)
+	tunnel := &fakeTunnel{reason: "нет связи со шлюзом"}
+	a.cfg.Tunnel = tunnel
+
+	if got := pass(t, a, cl, spec, 5*time.Second); got.ObservedState != client.ContainerRunning || !got.Unresponsive {
+		t.Fatalf("container behind a broken tunnel is not ready, got %+v", got)
+	}
+	tunnel.ok = true
+	if got := pass(t, a, cl, spec, 5*time.Second); got.ObservedState != client.ContainerReady || got.Unresponsive {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestNewContainerSpecWaitsForReadinessAgain(t *testing.T) {
+	port := newAppPort(t)
+	a, cl, cont, _, spec := readinessAgent(t, port.port)
+	if got := pass(t, a, cl, spec, 5*time.Second); !got.Unresponsive {
+		t.Fatalf("got %+v", got)
+	}
+
+	cont.set("h2")
+	a.readyTimeout = 5 * time.Second
+	opened := make(chan struct{})
+	time.AfterFunc(300*time.Millisecond, func() {
+		port.open()
+		close(opened)
+	})
+	got := pass(t, a, cl, spec, 5*time.Second)
+	<-opened
+	if got.ObservedState != client.ContainerReady || got.Unresponsive {
+		t.Fatalf("new spec must be waited for again, got %+v", got)
+	}
+}
+
+func TestRestartedContainerWaitsForReadinessAgain(t *testing.T) {
+	port := newAppPort(t)
+	port.open()
+	a, cl, _, _, spec := readinessAgent(t, port.port)
+	if got := pass(t, a, cl, spec, 5*time.Second); got.ObservedState != client.ContainerReady {
+		t.Fatalf("got %+v", got)
+	}
+	port.close()
+	if got := pass(t, a, cl, spec, 5*time.Second); got.ObservedState != client.ContainerReady {
+		t.Fatalf("ready container stays ready until it is restarted, got %+v", got)
+	}
+
+	a.reportContainerPhase(context.Background(), client.AgentContainerObserved{ObservedState: client.ContainerStarting, SpecHash: "h1"})
+	got := pass(t, a, cl, spec, 5*time.Second)
+	if got.ObservedState != client.ContainerRunning || !got.Unresponsive {
+		t.Fatalf("container started again must be checked again, got %+v", got)
+	}
+}
+
+func TestRemountRestartWaitsForReadinessAgain(t *testing.T) {
+	port := newAppPort(t)
+	port.open()
+	a, cl, _, dk, spec := readinessAgent(t, port.port)
+	dk.set("d1", true)
+	dk.mountIDs = map[string]string{"d1": "inv-1"}
+	spec.Disks = []client.AgentDiskSpec{diskSpec("d1")}
+	for range 2 {
+		if got := pass(t, a, cl, spec, 5*time.Second); got.ObservedState != client.ContainerReady {
+			t.Fatalf("got %+v", got)
+		}
+	}
+
+	port.close()
+	dk.mu.Lock()
+	dk.mountIDs["d1"] = "inv-2"
+	dk.mu.Unlock()
+	got := pass(t, a, cl, spec, 5*time.Second)
+	if got.ObservedState != client.ContainerRunning || !got.Unresponsive {
+		t.Fatalf("container restarted after a remount must be checked again, got %+v", got)
+	}
+}
+
+func TestOlderSpecFromTheStreamIsDropped(t *testing.T) {
+	a := New(Config{Logger: testLogger(), Lifecycle: &fakeLifecycle{}})
+	specs := make(chan *client.AgentSpec, 4)
+	done := make(chan struct{})
+	go a.intake(specs, done)
+
+	newer := specWithWork()
+	newer.Generation = 5
+	older := deletion(specWithWork())
+	older.Generation = 3
+	same := specWithWork()
+	same.Generation = 5
+	specs <- newer
+	specs <- older
+	close(specs)
+	<-done
+
+	if got := a.inbox.get(); got != newer {
+		t.Fatalf("spec %d replaced generation 5", got.Generation)
+	}
+	if a.aliveContext(context.Background()).Err() != nil {
+		t.Fatal("stale deletion spec stopped alive work")
+	}
+
+	specs = make(chan *client.AgentSpec, 1)
+	done = make(chan struct{})
+	go a.intake(specs, done)
+	specs <- same
+	close(specs)
+	<-done
+	if got := a.inbox.get(); got != same {
+		t.Fatal("snapshot of the same generation must be taken")
 	}
 }

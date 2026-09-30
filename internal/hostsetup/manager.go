@@ -89,6 +89,10 @@ func (m *Manager) emit(ctx context.Context, obs client.AgentSetupObserved) {
 }
 
 func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
+	if m.reachedReady {
+		m.check(ctx)
+		return ready()
+	}
 	m.ensureAptLockConfig(ctx)
 
 	steps := m.steps()
@@ -96,9 +100,7 @@ func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
 	for i, s := range steps {
 		progress := i * 100 / total
 		if s.skip(ctx) {
-			if !m.reachedReady {
-				m.emit(ctx, client.AgentSetupObserved{ObservedState: s.phase, Progress: ptrInt(progress)})
-			}
+			m.emit(ctx, client.AgentSetupObserved{ObservedState: s.phase, Progress: ptrInt(progress)})
 			continue
 		}
 		m.log.Info("host-setup step starting", "phase", s.phase, "step", i+1, "of", total, "progress", progress)
@@ -110,6 +112,22 @@ func (m *Manager) Reconcile(ctx context.Context) client.AgentSetupObserved {
 	}
 	m.reachedReady = true
 	m.log.Info("host-setup complete: host ready")
+	return ready()
+}
+
+func (m *Manager) check(ctx context.Context) {
+	for _, s := range m.steps() {
+		if s.skip(ctx) {
+			continue
+		}
+		if ctx.Err() == nil {
+			m.log.Warn("host-setup check failed on a ready host, installers are not run again", "phase", s.phase)
+		}
+		return
+	}
+}
+
+func ready() client.AgentSetupObserved {
 	return client.AgentSetupObserved{ObservedState: client.SetupReady, Progress: ptrInt(100)}
 }
 

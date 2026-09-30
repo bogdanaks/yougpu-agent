@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
-	"net/http"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -95,12 +94,6 @@ type StateManager interface {
 	SetNotify(func())
 }
 
-type CredsProvider interface {
-	EnsureFresh(ctx context.Context) error
-	ForceRefresh(ctx context.Context) error
-	Run(ctx context.Context)
-}
-
 type Config struct {
 	Version           string
 	PollInterval      time.Duration
@@ -116,21 +109,24 @@ type Config struct {
 	State             StateManager
 	SSHKeys           SSHKeysReconciler
 	Lifecycle         LifecycleManager
-	Creds             CredsProvider
 	Logger            *slog.Logger
 }
 
 type Agent struct {
-	cfg                Config
-	started            time.Time
-	knownDiskID        map[string]bool
-	lastSpec           atomic.Pointer[client.AgentSpec]
-	containerReadyHash string
-	inbox              inbox
-	wake               chan struct{}
-	applied            atomic.Int64
-	mountIDs           map[string]string
-	containerAlive     bool
+	cfg            Config
+	started        time.Time
+	lastSpec       atomic.Pointer[client.AgentSpec]
+	inbox          inbox
+	wake           chan struct{}
+	applied        atomic.Int64
+	mountIDs       map[string]string
+	containerAlive bool
+	readyTimeout   time.Duration
+	readyProbe     time.Duration
+
+	readyMu    sync.Mutex
+	readyHash  string
+	waitedHash string
 
 	postMu       sync.Mutex
 	stateReports int
@@ -175,11 +171,12 @@ func New(cfg Config) *Agent {
 		cfg.ReconcileInterval = 60 * time.Second
 	}
 	a := &Agent{
-		cfg:         cfg,
-		started:     time.Now(),
-		knownDiskID: map[string]bool{},
-		inbox:       inbox{signal: make(chan struct{}, 1)},
-		wake:        make(chan struct{}, 1),
+		cfg:          cfg,
+		started:      time.Now(),
+		inbox:        inbox{signal: make(chan struct{}, 1)},
+		wake:         make(chan struct{}, 1),
+		readyTimeout: containerReadyTimeout,
+		readyProbe:   containerReadyProbeInterval,
 	}
 	if cfg.Container != nil {
 		cfg.Container.SetReporter(a.reportContainerPhase)
@@ -252,6 +249,9 @@ func (a *Agent) reportStatePhase(ctx context.Context, obs client.AgentStateObser
 }
 
 func (a *Agent) reportContainerPhase(ctx context.Context, obs client.AgentContainerObserved) {
+	if obs.ObservedState == client.ContainerStarting {
+		a.forgetReadiness()
+	}
 	a.reportPhase(ctx, "container", obs.ObservedState, func(s *client.AgentStatus) { s.Container = &obs })
 }
 
@@ -291,16 +291,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if err := a.cfg.Creds.EnsureFresh(ctx); err != nil {
-		var httpErr *client.HTTPError
-		if errors.As(err, &httpErr) && httpErr.Status == http.StatusBadRequest {
-			a.cfg.Logger.Info("no storage drive attached; skipping initial credentials fetch")
-		} else {
-			a.cfg.Logger.Warn("initial credentials fetch failed; will retry in background", "err", err)
-		}
-	}
-
-	go a.cfg.Creds.Run(ctx)
 	go a.heartbeatLoop(ctx, cancel)
 
 	if a.cfg.Lifecycle.CurrentState() == lifecycle.StateSynced {
@@ -347,7 +337,13 @@ func (a *Agent) Run(ctx context.Context) error {
 
 func (a *Agent) intake(specs <-chan *client.AgentSpec, done chan<- struct{}) {
 	defer close(done)
+	highest := int64(-1)
 	for spec := range specs {
+		if spec.Generation < highest {
+			a.cfg.Logger.Warn("dropping spec older than one already received", "generation", spec.Generation, "highest", highest)
+			continue
+		}
+		highest = spec.Generation
 		a.inbox.put(spec)
 		if spec.Lifecycle.DeletionRequestedAt != nil {
 			a.stopAlive()
@@ -454,7 +450,6 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		}
 	}
 
-	a.refreshCredsIfDiskSetChanged(work, spec)
 	disksObserved := a.reconcileDisks(work, spec)
 
 	hasContent := a.cfg.Content != nil && spec.Content != nil
@@ -506,8 +501,11 @@ func (a *Agent) handleSpec(ctx context.Context, spec *client.AgentSpec) error {
 		a.cfg.Tunnel.Reconcile(ctx, spec.Tunnel)
 	}
 	if containerObserved != nil && containerObserved.ObservedState == client.ContainerRunning {
-		if a.ensureContainerReady(work, spec, containerObserved.SpecHash) {
+		switch a.containerReadiness(work, spec, containerObserved.SpecHash) {
+		case readinessReady:
 			containerObserved.ObservedState = client.ContainerReady
+		case readinessUnresponsive:
+			containerObserved.Unresponsive = true
 		}
 	}
 	if work.Err() != nil {
@@ -586,6 +584,7 @@ func (a *Agent) followRemounts(ctx context.Context, spec *client.AgentSpec, cont
 				if err := a.cfg.Container.Restart(ctx); err != nil {
 					a.cfg.Logger.Error("container restart after remount failed", "err", err)
 				}
+				a.forgetReadiness()
 				break
 			}
 		}
@@ -638,34 +637,76 @@ func deref(s *string) string {
 	return *s
 }
 
-func (a *Agent) ensureContainerReady(ctx context.Context, spec *client.AgentSpec, hash string) bool {
+type readiness int
+
+const (
+	readinessUnknown readiness = iota
+	readinessReady
+	readinessUnresponsive
+)
+
+func (a *Agent) forgetReadiness() {
+	a.readyMu.Lock()
+	defer a.readyMu.Unlock()
+	a.readyHash, a.waitedHash = "", ""
+}
+
+func (a *Agent) readinessOf(hash string) (ready, waited bool) {
+	a.readyMu.Lock()
+	defer a.readyMu.Unlock()
+	return hash != "" && a.readyHash == hash, hash != "" && a.waitedHash == hash
+}
+
+func (a *Agent) settleReadiness(hash string, ready bool) {
+	a.readyMu.Lock()
+	defer a.readyMu.Unlock()
+	if ready {
+		a.readyHash = hash
+	}
+	a.waitedHash = hash
+}
+
+func (a *Agent) containerReadiness(ctx context.Context, spec *client.AgentSpec, hash string) readiness {
 	if spec.Container == nil {
-		return true
+		return readinessReady
 	}
-	ports, ready := a.readinessTargets(spec)
+	ports, reachable := a.readinessTargets(spec)
 	if len(ports) == 0 {
+		return readinessReady
+	}
+	ready, waited := a.readinessOf(hash)
+	if ready {
+		return readinessReady
+	}
+	open := func() bool {
+		if !a.portsListening(ports) || !reachable() {
+			return false
+		}
+		a.settleReadiness(hash, true)
+		a.cfg.Logger.Info("container endpoints reachable; marking ready", "endpoints", len(ports))
 		return true
 	}
-	if hash != "" && a.containerReadyHash == hash {
-		return true
+	if waited {
+		if open() {
+			return readinessReady
+		}
+		return readinessUnresponsive
 	}
 
-	deadline := time.Now().Add(containerReadyTimeout)
+	deadline := time.Now().Add(a.readyTimeout)
 	for {
-		if a.portsListening(ports) && ready() {
-			a.containerReadyHash = hash
-			a.cfg.Logger.Info("container endpoints reachable; marking ready", "endpoints", len(ports))
-			return true
+		if open() {
+			return readinessReady
 		}
 		if time.Now().After(deadline) {
-			a.containerReadyHash = hash
-			a.cfg.Logger.Warn("container readiness timed out; marking ready (degraded)", "endpoints", len(ports))
-			return true
+			a.settleReadiness(hash, false)
+			a.cfg.Logger.Warn("container endpoints did not open in time; reporting it unresponsive", "endpoints", len(ports), "waited", a.readyTimeout.String())
+			return readinessUnresponsive
 		}
 		select {
 		case <-ctx.Done():
-			return false
-		case <-time.After(containerReadyProbeInterval):
+			return readinessUnknown
+		case <-time.After(a.readyProbe):
 		}
 	}
 }
@@ -722,25 +763,6 @@ func (a *Agent) postStatus(ctx context.Context, status *client.AgentStatus, stat
 	return nil
 }
 
-func (a *Agent) refreshCredsIfDiskSetChanged(ctx context.Context, spec *client.AgentSpec) {
-	specIDs := make(map[string]bool, len(spec.Disks))
-	hasNew := false
-	for _, d := range spec.Disks {
-		specIDs[d.ID] = true
-		if !a.knownDiskID[d.ID] {
-			hasNew = true
-		}
-	}
-	a.knownDiskID = specIDs
-	if !hasNew {
-		return
-	}
-	a.cfg.Logger.Info("disk set changed, refreshing credentials to update scope")
-	if err := a.cfg.Creds.ForceRefresh(ctx); err != nil {
-		a.cfg.Logger.Error("force refresh on disk-set change failed", "err", err)
-	}
-}
-
 func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []client.AgentDiskObserved {
 	observed := a.observeDisks(ctx)
 	actions := reconcile.Reconcile(spec, observed)
@@ -754,15 +776,16 @@ func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []cl
 	}
 
 	errs := map[string]string{}
-	mountErrored := false
 	for _, action := range actions {
+		if ctx.Err() != nil {
+			break
+		}
 		switch v := action.(type) {
 		case reconcile.MountDisk:
 			a.cfg.Logger.Info("mounting disk", "id", v.Spec.ID, "path", v.Spec.MountPath)
 			if err := a.cfg.Disk.Mount(ctx, v.Spec); err != nil {
 				a.cfg.Logger.Error("mount failed", "id", v.Spec.ID, "err", err)
 				errs[v.Spec.ID] = fetch.Clip(err.Error(), maxError)
-				mountErrored = true
 			}
 		case reconcile.UnmountDisk:
 			a.cfg.Logger.Info("unmounting disk", "id", v.ID)
@@ -778,26 +801,6 @@ func (a *Agent) reconcileDisks(ctx context.Context, spec *client.AgentSpec) []cl
 				a.cfg.Logger.Info("orphan disk keeps uploading its cache, unmount postponed", "id", v.ID)
 			} else if err != nil {
 				a.cfg.Logger.Error("orphan unmount failed", "id", v.ID, "err", err)
-			}
-		}
-	}
-
-	if mountErrored {
-		a.cfg.Logger.Warn("mount error detected, forcing credentials refresh and retrying once")
-		if err := a.cfg.Creds.ForceRefresh(ctx); err != nil {
-			a.cfg.Logger.Error("force refresh after mount error failed", "err", err)
-		} else {
-			retryActions := reconcile.Reconcile(spec, a.observeDisks(ctx))
-			for _, action := range retryActions {
-				if v, ok := action.(reconcile.MountDisk); ok {
-					a.cfg.Logger.Info("retrying mount after creds refresh", "id", v.Spec.ID)
-					if err := a.cfg.Disk.Mount(ctx, v.Spec); err != nil {
-						a.cfg.Logger.Error("retry mount failed", "id", v.Spec.ID, "err", err)
-						errs[v.Spec.ID] = fetch.Clip(err.Error(), maxError)
-					} else {
-						delete(errs, v.Spec.ID)
-					}
-				}
 			}
 		}
 	}
