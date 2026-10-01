@@ -104,9 +104,10 @@ type pullMessage struct {
 }
 
 type layerState struct {
-	current int64
-	total   int64
-	done    bool
+	current    int64
+	total      int64
+	done       bool
+	downloaded bool
 }
 
 type pullAggregator struct {
